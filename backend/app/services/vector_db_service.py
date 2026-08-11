@@ -7,21 +7,33 @@ collection = client.get_or_create_collection(
 )
 
 
-def store_embeddings(chunks, embeddings):
+def store_embeddings(chunks, embeddings, sections):
 
     ids = [str(i) for i in range(len(chunks))]
+
+    metadatas = [
+        {"section": section}
+        for section in sections
+    ]
 
     collection.add(
         ids=ids,
         documents=chunks,
-        embeddings=embeddings.tolist()
+        embeddings=embeddings.tolist(),
+        metadatas=metadatas
     )
 
-def search_similar_chunks(query_embedding, n_results=3):
 
-    results = collection.query(
-        query_embeddings=[query_embedding.tolist()],
-        n_results=n_results
-    )
+def search_similar_chunks(query_embedding, n_results=10, section=None):
 
-    return results    
+    query = {
+        "query_embeddings": [query_embedding.tolist()],
+        "n_results": n_results
+    }
+
+    if section:
+        query["where"] = {"section": section}
+
+    results = collection.query(**query)
+
+    return results["documents"][0]

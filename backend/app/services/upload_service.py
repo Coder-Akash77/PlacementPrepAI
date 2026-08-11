@@ -17,14 +17,14 @@ def save_uploaded_file(file):
     # Extract text
     text = extract_text_from_pdf(save_path)
 
-    # Split text into chunks
-    chunks = split_text(text)
+   # Split text into chunks
+    chunks, sections = split_text(text)
 
     # Generate embeddings
     embeddings = generate_embeddings(chunks)
 
-    # Store in ChromaDB
-    store_embeddings(chunks, embeddings)
+    # Store embeddings
+    store_embeddings(chunks, embeddings, sections)
 
     return {
         "file_path": save_path,
