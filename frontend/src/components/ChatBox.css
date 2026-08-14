@@ -64,3 +64,10 @@
     background-color: #e5e7eb;
     color: #111827;
 }
+.error-message {
+    padding: 10px 15px;
+    border-radius: 10px;
+    margin: 0;
+    background-color: #fee2e2;
+    color: #991b1b;
+}

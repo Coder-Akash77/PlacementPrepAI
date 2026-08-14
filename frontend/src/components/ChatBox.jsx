@@ -1,23 +1,66 @@
 import { useState } from "react";
 import "./ChatBox.css";
+
+const API_URL = "http://127.0.0.1:8000/chat/";
 function ChatBox() {
     const [question, setQuestion] = useState("");
     const [messages, setMessages] = useState([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState("");
 
-    const handleSend = () => {
+    const handleSend = async () => {
         if (question.trim() === "") {
             return;
         }
+
+        const userQuestion = question;
+        setIsLoading(true);
 
         setMessages([
             ...messages,
             {
                 role: "user",
-                text: question
+                text: userQuestion
             }
         ]);
 
         setQuestion("");
+
+        // console.log("Sending question to backend:", userQuestion);
+        try {
+            const response = await fetch(API_URL, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    question: userQuestion
+                })
+            });
+
+            const data = await response.json();
+
+            setIsLoading(false);
+
+            console.log("Backend response:", data);
+            console.log("AI answer:", data.answer);
+
+            setMessages([
+                ...messages,
+                {
+                    role: "user",
+                    text: userQuestion
+                },
+                {
+                    role: "ai",
+                    text: data.answer
+                }
+            ]);
+        } catch (error) {
+    setIsLoading(false);
+    setError("Sorry, something went wrong. Please try again.");
+    console.log("API error:", error);
+}
     };
 
     const handleKeyDown = (e) => {
@@ -55,6 +98,17 @@ function ChatBox() {
                         {message.text}
                     </p>
                 ))}
+
+                {isLoading && (
+                    <p className="ai-message">
+                        AI is thinking...
+                    </p>
+                )}
+                {error && (
+    <p className="error-message">
+        {error}
+    </p>
+)}
             </div>
 
         </section>
