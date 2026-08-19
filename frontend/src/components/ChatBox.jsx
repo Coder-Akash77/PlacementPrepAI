@@ -1,5 +1,5 @@
-import { useState } from "react";
-import "./ChatBox.css";
+import { useState, useRef, useEffect } from "react";import "./ChatBox.css";
+import ReactMarkdown from "react-markdown";
 
 const API_URL = "http://127.0.0.1:8000/chat/";
 function ChatBox() {
@@ -7,6 +7,13 @@ function ChatBox() {
     const [messages, setMessages] = useState([]);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState("");
+    const messagesEndRef = useRef(null);
+
+    useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({
+        behavior: "smooth"
+    });
+}, [messages, isLoading]);
 
     const handleSend = async () => {
         if (question.trim() === "") {
@@ -57,10 +64,10 @@ function ChatBox() {
                 }
             ]);
         } catch (error) {
-    setIsLoading(false);
-    setError("Sorry, something went wrong. Please try again.");
-    console.log("API error:", error);
-}
+            setIsLoading(false);
+            setError("Sorry, something went wrong. Please try again.");
+            console.log("API error:", error);
+        }
     };
 
     const handleKeyDown = (e) => {
@@ -84,19 +91,26 @@ function ChatBox() {
                     value={question}
                     onChange={(e) => setQuestion(e.target.value)}
                     onKeyDown={handleKeyDown}
+                    disabled={isLoading}
                 />
 
-                <button onClick={handleSend}>Send</button>
+                <button onClick={handleSend} disabled={isLoading}>
+                    Send
+                </button>
             </div>
 
             <div className="messages">
                 {messages.map((message, index) => (
-                    <p
+                    <div
                         key={index}
                         className={message.role === "user" ? "user-message" : "ai-message"}
                     >
-                        {message.text}
-                    </p>
+                        {message.role === "ai" ? (
+                            <ReactMarkdown>{message.text}</ReactMarkdown>
+                        ) : (
+                            <p>{message.text}</p>
+                        )}
+                    </div>
                 ))}
 
                 {isLoading && (
@@ -105,10 +119,12 @@ function ChatBox() {
                     </p>
                 )}
                 {error && (
-    <p className="error-message">
-        {error}
-    </p>
-)}
+                    <p className="error-message">
+                        {error}
+                    </p>
+                )}
+
+                <div ref={messagesEndRef}></div>
             </div>
 
         </section>
