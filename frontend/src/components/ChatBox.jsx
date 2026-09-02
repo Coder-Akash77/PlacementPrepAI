@@ -21,15 +21,18 @@ function ChatBox() {
         }
 
         const userQuestion = question;
-        setIsLoading(true);
 
-        setMessages([
-            ...messages,
-            {
-                role: "user",
-                text: userQuestion
-            }
-        ]);
+setError("");
+setIsLoading(true);
+
+        setMessages((previousMessages) => [
+    ...previousMessages,
+    {
+        role: "user",
+        text: userQuestion
+    }
+]);
+
 
         setQuestion("");
 
@@ -52,17 +55,13 @@ function ChatBox() {
             console.log("Backend response:", data);
             console.log("AI answer:", data.answer);
 
-            setMessages([
-                ...messages,
-                {
-                    role: "user",
-                    text: userQuestion
-                },
-                {
-                    role: "ai",
-                    text: data.answer
-                }
-            ]);
+            setMessages((previousMessages) => [
+    ...previousMessages,
+    {
+        role: "ai",
+        text: data.answer
+    }
+]);
         } catch (error) {
             setIsLoading(false);
             setError("Sorry, something went wrong. Please try again.");
@@ -84,6 +83,26 @@ function ChatBox() {
                 education, or placement preparation.
             </p>
 
+            {messages.length === 0 && (
+    <div className="suggested-questions">
+        <p className="suggested-title">Try asking</p>
+
+        <div className="suggestion-list">
+            <button onClick={() => setQuestion("What projects are on my resume?")}>
+                What projects are on my resume?
+            </button>
+
+            <button onClick={() => setQuestion("What skills do I have?")}>
+                What skills do I have?
+            </button>
+
+            <button onClick={() => setQuestion("How should I prepare for placements?")}>
+                How should I prepare for placements?
+            </button>
+        </div>
+    </div>
+)}
+
             <div className="chat-input">
                 <input
                     type="text"
@@ -102,22 +121,28 @@ function ChatBox() {
             <div className="messages">
                 {messages.map((message, index) => (
                     <div
-                        key={index}
-                        className={message.role === "user" ? "user-message" : "ai-message"}
-                    >
-                        {message.role === "ai" ? (
-                            <ReactMarkdown>{message.text}</ReactMarkdown>
-                        ) : (
-                            <p>{message.text}</p>
-                        )}
-                    </div>
+    key={index}
+    className={message.role === "user" ? "user-message" : "ai-message"}
+>
+    <div className="message-label">
+        {message.role === "user" ? "You" : "PlacementPrepAI"}
+    </div>
+
+    {message.role === "ai" ? (
+        <ReactMarkdown>{message.text}</ReactMarkdown>
+    ) : (
+        <p>{message.text}</p>
+    )}
+</div>
                 ))}
 
                 {isLoading && (
-                    <p className="ai-message">
-                        AI is thinking...
-                    </p>
-                )}
+    <div className="ai-message typing-indicator">
+        <span></span>
+        <span></span>
+        <span></span>
+    </div>
+)}
                 {error && (
                     <p className="error-message">
                         {error}

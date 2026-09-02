@@ -2,14 +2,53 @@ nav {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 20px 40px;
-    border-bottom: 1px solid #333;
+    padding: 18px 40px;
+    border-bottom: 1px solid #e5e7eb;
+    background: #ffffff;
 }
 
-nav h2 {
+.navbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.navbar-brand h2 {
     margin: 0;
+    font-size: 22px;
+    color: #111827;
 }
 
-nav span {
-    font-size: 16px;
+.navbar-brand span {
+    font-size: 14px;
+    color: #6b7280;
+}
+
+.navbar-status {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 14px;
+    color: #4b5563;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #22c55e;
+}
+
+@media (max-width: 600px) {
+    nav {
+        padding: 16px 20px;
+    }
+
+    .navbar-brand span {
+        display: none;
+    }
+
+    .navbar-brand h2 {
+        font-size: 20px;
+    }
 }
