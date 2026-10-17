@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import health, resume
+from app.api import chat, health, resume
 from app.config import settings
 
 app = FastAPI(title="PlacementPrepAI", version="0.1.0")
@@ -17,6 +17,7 @@ app.add_middleware(
 
 app.include_router(health.router, prefix="/api")
 app.include_router(resume.router, prefix="/api")
+app.include_router(chat.router, prefix="/api")
 
 
 @app.get("/")
