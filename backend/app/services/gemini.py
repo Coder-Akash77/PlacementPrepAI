@@ -1,7 +1,12 @@
+import logging
+import re
+
 from google import genai
 from google.genai.errors import APIError
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class GeminiConfigurationError(RuntimeError):
@@ -10,6 +15,19 @@ class GeminiConfigurationError(RuntimeError):
 
 class GeminiGenerationError(RuntimeError):
     """Raised when Gemini cannot generate a response."""
+
+
+def _safe_error_message(error: APIError) -> str:
+    message = getattr(error, "message", "") or "No provider message."
+    if settings.GEMINI_API_KEY:
+        message = message.replace(settings.GEMINI_API_KEY, "[REDACTED]")
+    message = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[REDACTED]", message)
+    message = re.sub(
+        r"(?i)(api[_ -]?key\s*[:=]\s*)[^\s,;]+",
+        r"\1[REDACTED]",
+        message,
+    )
+    return message
 
 
 def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
@@ -29,11 +47,18 @@ def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
     )
 
     try:
-        response = genai.Client(api_key=settings.GEMINI_API_KEY).models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
-        )
+        with genai.Client(api_key=settings.GEMINI_API_KEY) as client:
+            response = client.models.generate_content(
+                model=settings.GEMINI_MODEL,
+                contents=prompt,
+            )
     except APIError as exc:
+        logger.warning(
+            "Gemini API request failed (code=%s, status=%s): %s",
+            getattr(exc, "code", "unknown"),
+            getattr(exc, "status", "unknown"),
+            _safe_error_message(exc),
+        )
         raise GeminiGenerationError("Gemini could not generate a response.") from exc
 
     answer = response.text

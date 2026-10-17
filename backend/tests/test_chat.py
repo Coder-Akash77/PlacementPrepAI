@@ -3,7 +3,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
-from google.genai.errors import APIError
+from google.genai.errors import ClientError
 
 from app.api import chat as chat_api
 from app.main import app
@@ -103,6 +103,12 @@ class ChatTests(unittest.TestCase):
                 self.api_key = api_key
                 self.models = FakeModels()
 
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
         with (
             patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
             patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
@@ -127,19 +133,39 @@ class ChatTests(unittest.TestCase):
     def test_gemini_service_wraps_api_error_without_exposing_details(self):
         class FakeModels:
             def generate_content(self, **kwargs):
-                raise APIError(500, {"message": "sensitive provider detail"})
+                raise ClientError(
+                    404,
+                    {
+                        "error": {
+                            "code": 404,
+                            "status": "NOT_FOUND",
+                            "message": "Model unavailable; api_key=test-secret",
+                        }
+                    },
+                )
 
         class FakeClient:
             def __init__(self, api_key):
                 self.models = FakeModels()
 
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
         with (
             patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
             patch.object(gemini.genai, "Client", FakeClient),
+            self.assertLogs(gemini.logger, level="WARNING") as captured,
         ):
             with self.assertRaises(GeminiGenerationError) as error:
                 gemini.answer_resume_question("Question?", [])
         self.assertNotIn("sensitive", str(error.exception))
+        self.assertIn("404", captured.output[0])
+        self.assertIn("NOT_FOUND", captured.output[0])
+        self.assertIn("Model unavailable", captured.output[0])
+        self.assertNotIn("test-secret", captured.output[0])
 
 
 if __name__ == "__main__":
