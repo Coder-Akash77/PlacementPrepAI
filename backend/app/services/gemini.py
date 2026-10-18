@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 
@@ -65,3 +66,74 @@ def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
     if not answer or not answer.strip():
         raise GeminiGenerationError("Gemini returned an empty response.")
     return answer.strip()
+
+
+def generate_interview_question(
+    resume_chunks: list[dict], previous_questions: list[str]
+) -> str:
+    context = "\n\n".join(
+        f"[{chunk['section']}]\n{chunk['text']}" for chunk in resume_chunks
+    )
+    prompt = (
+        "Generate exactly one concise mock interview question at a time. "
+        "Base it on the candidate's retrieved resume context and do not assume "
+        "qualifications that are not present. Do not answer the question or add "
+        "numbering or commentary. Avoid repeating prior questions.\n\n"
+        f"Retrieved resume context:\n{context or '(No relevant resume information found.)'}"
+        f"\n\nPrior questions:\n{json.dumps(previous_questions)}"
+    )
+    return _generate_text(prompt)
+
+
+def evaluate_interview_answer(
+    question: str, answer: str, resume_chunks: list[dict]
+) -> dict:
+    context = "\n\n".join(
+        f"[{chunk['section']}]\n{chunk['text']}" for chunk in resume_chunks
+    )
+    prompt = (
+        "Evaluate the candidate's interview answer. Ground resume-specific "
+        "feedback in the retrieved resume context; never invent qualifications "
+        "or experience. Return only a JSON object with exactly these fields: "
+        '"score" (integer 0-100), "strengths" (non-empty array of strings), '
+        '"improvements" (non-empty array of strings), and '
+        '"improved_sample_answer" (string). The sample may improve framing but '
+        "must not add unsupported personal facts.\n\n"
+        f"Retrieved resume context:\n{context or '(No relevant resume information found.)'}"
+        f"\n\nInterview question:\n{question}\n\nCandidate answer:\n{answer}"
+    )
+    raw_response = _generate_text(prompt, response_mime_type="application/json")
+    try:
+        evaluation = json.loads(raw_response)
+    except json.JSONDecodeError as exc:
+        raise GeminiGenerationError("Gemini returned invalid evaluation JSON.") from exc
+    if not isinstance(evaluation, dict):
+        raise GeminiGenerationError("Gemini returned an invalid evaluation.")
+    return evaluation
+
+
+def _generate_text(prompt: str, response_mime_type: str | None = None) -> str:
+    if not settings.GEMINI_API_KEY:
+        raise GeminiConfigurationError("Gemini API key is not configured.")
+
+    config = {"response_mime_type": response_mime_type} if response_mime_type else None
+    try:
+        with genai.Client(api_key=settings.GEMINI_API_KEY) as client:
+            response = client.models.generate_content(
+                model=settings.GEMINI_MODEL,
+                contents=prompt,
+                config=config,
+            )
+    except APIError as exc:
+        logger.warning(
+            "Gemini API request failed (code=%s, status=%s): %s",
+            getattr(exc, "code", "unknown"),
+            getattr(exc, "status", "unknown"),
+            _safe_error_message(exc),
+        )
+        raise GeminiGenerationError("Gemini could not generate a response.") from exc
+
+    text = response.text
+    if not text or not text.strip():
+        raise GeminiGenerationError("Gemini returned an empty response.")
+    return text.strip()
