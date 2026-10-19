@@ -112,6 +112,53 @@ def evaluate_interview_answer(
     return evaluation
 
 
+def generate_preparation_question(mode: str, topic: str | None = None) -> str:
+    mode_instructions = {
+        "dsa": "Focus on algorithms and data structures. Ask one problem-solving question.",
+        "sql": "Focus on SQL concepts or query-writing. Ask one clear question.",
+        "hr": "Focus on behavioral and interpersonal interview preparation. Ask one behavioral question.",
+    }
+    if mode not in mode_instructions:
+        raise ValueError("Unsupported preparation mode.")
+
+    prompt = (
+        f"{mode_instructions[mode]} Generate exactly one question with no answer "
+        "or extra commentary."
+    )
+    if topic:
+        prompt += f"\nFocus topic: {topic}"
+    return _generate_text(prompt)
+
+
+def evaluate_preparation_answer(mode: str, question: str, answer: str) -> dict:
+    mode_instructions = {
+        "dsa": "Assess algorithmic correctness, data-structure choices, and complexity.",
+        "sql": "Assess SQL correctness, query reasoning, and relevant database concepts.",
+        "hr": "Assess behavioral response clarity, relevance, and communication.",
+    }
+    if mode not in mode_instructions:
+        raise ValueError("Unsupported preparation mode.")
+
+    prompt = (
+        f"{mode_instructions[mode]} Evaluate the submitted answer to the question. "
+        "Return only a JSON object with exactly these fields: "
+        '"score" (integer from 0 to 100), "strengths" (non-empty array of strings), '
+        '"improvements" (non-empty array of strings), and '
+        '"suggested_answer" (string containing a model answer or explanation). '
+        "For HR, do not invent personal experience; make clear that the answer "
+        "is a template for the user to adapt.\n\n"
+        f"Question:\n{question}\n\nSubmitted answer:\n{answer}"
+    )
+    raw_response = _generate_text(prompt, response_mime_type="application/json")
+    try:
+        evaluation = json.loads(raw_response)
+    except json.JSONDecodeError as exc:
+        raise GeminiGenerationError("Gemini returned invalid evaluation JSON.") from exc
+    if not isinstance(evaluation, dict):
+        raise GeminiGenerationError("Gemini returned an invalid evaluation.")
+    return evaluation
+
+
 def _generate_text(prompt: str, response_mime_type: str | None = None) -> str:
     if not settings.GEMINI_API_KEY:
         raise GeminiConfigurationError("Gemini API key is not configured.")

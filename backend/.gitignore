@@ -4,5 +4,7 @@ venv/
 __pycache__/
 *.pyc
 data/chroma/
+data/*.db
+data/*.db-*
 data/uploads/*
 !data/uploads/.gitkeep

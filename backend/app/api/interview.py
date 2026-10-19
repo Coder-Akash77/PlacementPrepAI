@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from app.services import history
 from app.services.gemini import (
     GeminiConfigurationError,
     GeminiGenerationError,
@@ -70,6 +71,33 @@ def _get_session(session_id: UUID):
         return get_session(str(session_id))
     except InterviewSessionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except history.HistoryStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _history_error(exc: Exception):
+    if isinstance(exc, history.HistoryRecordNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, history.HistoryConflictError):
+        return HTTPException(status_code=409, detail=str(exc))
+    return HTTPException(status_code=503, detail="Persistent history is unavailable.")
+
+
+def _evaluate(question: str, answer: str, resume_id: str) -> InterviewEvaluation:
+    try:
+        chunks = search_resume(resume_id, question)
+    except ResumeIndexNotFound as exc:
+        raise HTTPException(status_code=404, detail="Resume not found.") from exc
+
+    try:
+        raw_evaluation = evaluate_interview_answer(question, answer, chunks)
+        return InterviewEvaluation.model_validate(raw_evaluation)
+    except GeminiConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (GeminiGenerationError, ValidationError) as exc:
+        raise HTTPException(
+            status_code=502, detail="Gemini returned an invalid evaluation."
+        ) from exc
 
 
 def _generate_question(resume_id: str, questions: list[str]) -> str:
@@ -90,11 +118,15 @@ def _generate_question(resume_id: str, questions: list[str]) -> str:
 @router.post("/start")
 def start_interview(request: InterviewStartRequest):
     first_question = _generate_question(str(request.resume_id), [])
-    session = create_session(str(request.resume_id), first_question)
+    try:
+        session = create_session(str(request.resume_id), first_question)
+    except history.HistoryStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "session_id": session.session_id,
         "resume_id": session.resume_id,
         "question": session.current_question,
+        "question_id": session.current_question_id,
     }
 
 
@@ -108,6 +140,8 @@ def answer_interview_question(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InvalidInterviewState as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (history.HistoryStorageError, history.HistoryRecordNotFound) as exc:
+        raise _history_error(exc) from exc
 
     return {
         "session_id": str(session_id),
@@ -133,7 +167,13 @@ def next_interview_question(session_id: UUID):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except InvalidInterviewState as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"session_id": str(session_id), "question": session.current_question}
+    except (history.HistoryStorageError, history.HistoryRecordNotFound) as exc:
+        raise _history_error(exc) from exc
+    return {
+        "session_id": str(session_id),
+        "question": session.current_question,
+        "question_id": session.current_question_id,
+    }
 
 
 @router.post("/{session_id}/evaluate")
@@ -146,25 +186,75 @@ def evaluate_submitted_answer(session_id: UUID):
     except InvalidInterviewState as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    evaluation = _evaluate(
+        submitted["question"], submitted["answer"], session.resume_id
+    )
     try:
-        chunks = search_resume(session.resume_id, submitted["question"])
-    except ResumeIndexNotFound as exc:
-        raise HTTPException(status_code=404, detail="Resume not found.") from exc
-
-    try:
-        raw_evaluation = evaluate_interview_answer(
-            submitted["question"], submitted["answer"], chunks
+        history.add_interview_evaluation(
+            submitted["answer_id"], evaluation.model_dump()
         )
-        evaluation = InterviewEvaluation.model_validate(raw_evaluation)
-    except GeminiConfigurationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except (GeminiGenerationError, ValidationError) as exc:
-        raise HTTPException(
-            status_code=502, detail="Gemini returned an invalid evaluation."
-        ) from exc
+    except (history.HistoryStorageError, history.HistoryRecordNotFound) as exc:
+        raise _history_error(exc) from exc
 
     return {
         "session_id": str(session_id),
         "question": submitted["question"],
+        **evaluation.model_dump(),
+    }
+
+
+@router.get("/history")
+def interview_history(resume_id: UUID):
+    try:
+        return {"sessions": history.list_interview_sessions(str(resume_id))}
+    except history.HistoryStorageError as exc:
+        raise _history_error(exc) from exc
+
+
+@router.get("/history/{session_id}")
+def interview_history_detail(session_id: UUID):
+    try:
+        return history.get_interview_session(str(session_id))
+    except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
+        raise _history_error(exc) from exc
+
+
+@router.get("/history/questions/{question_id}")
+def interview_question_detail(question_id: UUID):
+    try:
+        return history.get_interview_question(str(question_id))
+    except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
+        raise _history_error(exc) from exc
+
+
+@router.post("/history/questions/{question_id}/answers")
+def answer_historical_interview_question(
+    question_id: UUID, request: InterviewAnswerRequest
+):
+    try:
+        answer_id = history.add_interview_answer(str(question_id), request.answer)
+    except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
+        raise _history_error(exc) from exc
+    return {"question_id": str(question_id), "answer_id": answer_id}
+
+
+@router.post("/history/answers/{answer_id}/evaluate")
+def reevaluate_historical_interview_answer(answer_id: UUID):
+    try:
+        submitted = history.get_interview_answer(str(answer_id))
+    except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
+        raise _history_error(exc) from exc
+    evaluation = _evaluate(
+        submitted["question"], submitted["answer"], submitted["resume_id"]
+    )
+    try:
+        evaluation_id = history.add_interview_evaluation(
+            str(answer_id), evaluation.model_dump()
+        )
+    except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
+        raise _history_error(exc) from exc
+    return {
+        "answer_id": str(answer_id),
+        "evaluation_id": evaluation_id,
         **evaluation.model_dump(),
     }

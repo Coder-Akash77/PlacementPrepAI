@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -6,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.api import interview as interview_api
 from app.main import app
+from app.config import settings
 from app.services import interview as interview_service
 from app.services.gemini import GeminiGenerationError
 from app.services.interview import _sessions, _sessions_lock
@@ -15,6 +17,11 @@ class InterviewTests(unittest.TestCase):
     def setUp(self):
         with _sessions_lock:
             _sessions.clear()
+        self.database_dir = tempfile.TemporaryDirectory()
+        old_db_path = settings.HISTORY_DB_PATH
+        settings.HISTORY_DB_PATH = f"{self.database_dir.name}\\history.db"
+        self.addCleanup(setattr, settings, "HISTORY_DB_PATH", old_db_path)
+        self.addCleanup(self.database_dir.cleanup)
         self.client = TestClient(app)
         self.resume_id = str(uuid4())
         self.chunks = [{"section": "Experience", "text": "Built APIs"}]
