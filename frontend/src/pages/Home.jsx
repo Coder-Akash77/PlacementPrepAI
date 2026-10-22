@@ -1,10 +1,21 @@
 import { useEffect, useState } from "react";
 import {
   checkHealth,
+  evaluatePreparationAnswer,
   evaluateInterviewAnswer,
+  getInterviewHistory,
+  getInterviewHistorySession,
+  getInterviewQuestionHistory,
+  getPreparationHistory,
+  getPreparationQuestionHistory,
+  generatePreparationQuestion,
+  reevaluateHistoricalInterviewAnswer,
+  reevaluateHistoricalPreparationAnswer,
   requestNextQuestion,
   sendChatMessage,
   startInterview,
+  submitHistoricalInterviewAnswer,
+  submitHistoricalPreparationAnswer,
   submitInterviewAnswer,
   uploadResume,
 } from "../services/api.js";
@@ -119,6 +130,151 @@ function MarkdownContent({ children }) {
   return <div className="markdown-content">{blocks}</div>;
 }
 
+function HistoryQuestionDetails({
+  item,
+  onSubmitAnswer,
+  submitting,
+  error,
+  onReevaluate,
+  reevaluatingAnswerId,
+  reevaluationError,
+}) {
+  const [newAnswer, setNewAnswer] = useState("");
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    const trimmedAnswer = newAnswer.trim();
+    if (!trimmedAnswer || submitting) return;
+    const saved = await onSubmitAnswer(trimmedAnswer);
+    if (saved) setNewAnswer("");
+  }
+
+  return (
+    <section className="evaluation-card">
+      <span className="question-label">QUESTION HISTORY</span>
+      <h3>{item.question}</h3>
+      {!item.answers?.length ? (
+        <p className="helper-note">No answers have been submitted for this question.</p>
+      ) : (
+        <>
+          <div className="sample-answer">
+            <h4>Score comparison by attempt</h4>
+            {item.answers.map((attempt) => (
+              <div className="sample-answer" key={`comparison-${attempt.answer_id}`}>
+                <div className="score-row">
+                  <strong>Attempt {attempt.attempt_no}</strong>
+                  <span>
+                    {attempt.evaluations?.length
+                      ? attempt.evaluations.map((evaluation, index) => {
+                          const hasScore =
+                            typeof evaluation.score === "number" &&
+                            Number.isFinite(evaluation.score);
+                          return (
+                            <span key={evaluation.evaluation_id}>
+                              {index > 0 ? " · " : ""}
+                              Evaluation {index + 1}:{" "}
+                              {hasScore ? `${evaluation.score}/100` : "Score unavailable"}
+                            </span>
+                          );
+                        })
+                      : "No evaluation or score recorded"}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+          {item.answers.map((attempt) => (
+            <article className="sample-answer" key={attempt.answer_id}>
+              <div className="score-row">
+                <h4>Attempt {attempt.attempt_no}</h4>
+                <button
+                  className="button button-outline"
+                  type="button"
+                  onClick={() => onReevaluate(attempt.answer_id)}
+                  disabled={Boolean(reevaluatingAnswerId) || submitting}
+                >
+                  {reevaluatingAnswerId === attempt.answer_id
+                    ? "Re-evaluating…"
+                    : "Re-evaluate"}
+                </button>
+              </div>
+              <p>{attempt.answer}</p>
+              {!attempt.evaluations?.length ? (
+                <span className="sample-answer-note">No evaluation recorded.</span>
+              ) : (
+                attempt.evaluations.map((evaluation) => {
+                  const feedback = evaluation.feedback || {};
+                  const hasScore =
+                    typeof evaluation.score === "number" &&
+                    Number.isFinite(evaluation.score);
+                  return (
+                    <div className="sample-answer" key={evaluation.evaluation_id}>
+                      <h4>
+                        Evaluation ·{" "}
+                        {hasScore ? `${evaluation.score}/100` : "Score unavailable"} ·{" "}
+                        {new Date(evaluation.created_at).toLocaleString()}
+                      </h4>
+                      {feedback.strengths?.length > 0 && (
+                        <>
+                          <strong>Strengths</strong>
+                          <ul>{feedback.strengths.map((text, index) => <li key={`${index}-${text}`}>{text}</li>)}</ul>
+                        </>
+                      )}
+                      {feedback.improvements?.length > 0 && (
+                        <>
+                          <strong>Improvements</strong>
+                          <ul>{feedback.improvements.map((text, index) => <li key={`${index}-${text}`}>{text}</li>)}</ul>
+                        </>
+                      )}
+                      {(feedback.suggested_answer || feedback.improved_sample_answer) && (
+                        <p>{feedback.suggested_answer || feedback.improved_sample_answer}</p>
+                      )}
+                      {!feedback.strengths?.length &&
+                        !feedback.improvements?.length &&
+                        !feedback.suggested_answer &&
+                        !feedback.improved_sample_answer && (
+                          <span className="sample-answer-note">
+                            No additional feedback recorded.
+                          </span>
+                        )}
+                    </div>
+                  );
+                })
+              )}
+            </article>
+          ))}
+        </>
+      )}
+      {reevaluatingAnswerId && (
+        <p className="loading-note" role="status">
+          Saving a new evaluation without replacing previous feedback…
+        </p>
+      )}
+      <ErrorMessage>{reevaluationError}</ErrorMessage>
+      <form className="answer-form" onSubmit={handleSubmit}>
+        <label htmlFor={`history-answer-${item.question_id}`}>New answer attempt</label>
+        <textarea
+          id={`history-answer-${item.question_id}`}
+          value={newAnswer}
+          onChange={(event) => setNewAnswer(event.target.value)}
+          rows="4"
+          maxLength="5000"
+          placeholder="Write another answer to this question…"
+          disabled={submitting}
+        />
+        <button
+          className="button button-primary"
+          type="submit"
+          disabled={!newAnswer.trim() || submitting}
+        >
+          {submitting ? "Submitting and evaluating…" : "Submit new attempt"}
+        </button>
+        <ErrorMessage>{error}</ErrorMessage>
+      </form>
+    </section>
+  );
+}
+
 export default function Home() {
   const [backendStatus, setBackendStatus] = useState("checking");
   const [resume, setResume] = useState(null);
@@ -136,6 +292,48 @@ export default function Home() {
   const [evaluation, setEvaluation] = useState(null);
   const [interviewBusy, setInterviewBusy] = useState("");
   const [interviewError, setInterviewError] = useState("");
+
+  const [preparationMode, setPreparationMode] = useState("dsa");
+  const [preparationTopic, setPreparationTopic] = useState("");
+  const [preparationSessionId, setPreparationSessionId] = useState("");
+  const [preparationQuestion, setPreparationQuestion] = useState(null);
+  const [preparationAnswer, setPreparationAnswer] = useState("");
+  const [preparationEvaluation, setPreparationEvaluation] = useState(null);
+  const [preparationBusy, setPreparationBusy] = useState("");
+  const [preparationError, setPreparationError] = useState("");
+
+  const [practiceHistoryIds, setPracticeHistoryIds] = useState(() => {
+    try {
+      const stored = JSON.parse(
+        window.localStorage.getItem("placementprep-practice-sessions") || "[]"
+      );
+      return Array.isArray(stored)
+        ? stored.filter((item) => item?.session_id && item?.mode)
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  const [practiceHistory, setPracticeHistory] = useState(null);
+  const [practiceQuestionHistory, setPracticeQuestionHistory] = useState(null);
+  const [practiceHistoryBusy, setPracticeHistoryBusy] = useState(false);
+  const [practiceHistoryError, setPracticeHistoryError] = useState("");
+  const [practiceAttemptBusy, setPracticeAttemptBusy] = useState(false);
+  const [practiceAttemptError, setPracticeAttemptError] = useState("");
+  const [practiceReevaluatingAnswerId, setPracticeReevaluatingAnswerId] =
+    useState("");
+  const [practiceReevaluationError, setPracticeReevaluationError] = useState("");
+
+  const [interviewHistory, setInterviewHistory] = useState([]);
+  const [interviewHistorySession, setInterviewHistorySession] = useState(null);
+  const [interviewQuestionHistory, setInterviewQuestionHistory] = useState(null);
+  const [interviewHistoryBusy, setInterviewHistoryBusy] = useState(false);
+  const [interviewHistoryError, setInterviewHistoryError] = useState("");
+  const [interviewAttemptBusy, setInterviewAttemptBusy] = useState(false);
+  const [interviewAttemptError, setInterviewAttemptError] = useState("");
+  const [interviewReevaluatingAnswerId, setInterviewReevaluatingAnswerId] =
+    useState("");
+  const [interviewReevaluationError, setInterviewReevaluationError] = useState("");
 
   useEffect(() => {
     checkHealth()
@@ -262,6 +460,257 @@ export default function Home() {
       setInterviewError(error.message);
     } finally {
       setInterviewBusy("");
+    }
+  }
+
+  function handlePreparationModeChange(event) {
+    setPreparationMode(event.target.value);
+    setPreparationSessionId("");
+    setPreparationQuestion(null);
+    setPreparationAnswer("");
+    setPreparationEvaluation(null);
+    setPreparationError("");
+  }
+
+  async function handleGeneratePreparationQuestion() {
+    setPreparationBusy("question");
+    setPreparationError("");
+    setPreparationQuestion(null);
+    setPreparationAnswer("");
+    setPreparationEvaluation(null);
+    try {
+      const result = await generatePreparationQuestion(
+        preparationMode,
+        preparationTopic.trim() || undefined,
+        preparationSessionId || undefined
+      );
+      setPreparationSessionId(result.session_id);
+      setPreparationQuestion(result);
+      const savedSessions = [
+        ...practiceHistoryIds.filter(
+          (item) => item.session_id !== result.session_id
+        ),
+        { session_id: result.session_id, mode: result.mode },
+      ];
+      setPracticeHistoryIds(savedSessions);
+      try {
+        window.localStorage.setItem(
+          "placementprep-practice-sessions",
+          JSON.stringify(savedSessions)
+        );
+      } catch {
+        setPreparationError(
+          "Question generated, but the practice session could not be saved in this browser."
+        );
+      }
+    } catch (error) {
+      setPreparationError(error.message);
+    } finally {
+      setPreparationBusy("");
+    }
+  }
+
+  async function handleEvaluatePreparationAnswer(event) {
+    event.preventDefault();
+    const trimmedAnswer = preparationAnswer.trim();
+    if (!preparationQuestion || !trimmedAnswer) return;
+
+    setPreparationBusy("evaluate");
+    setPreparationError("");
+    setPreparationEvaluation(null);
+    try {
+      const result = await evaluatePreparationAnswer(
+        preparationMode,
+        preparationQuestion.question,
+        trimmedAnswer,
+        preparationSessionId,
+        preparationQuestion.question_id
+      );
+      setPreparationAnswer(trimmedAnswer);
+      setPreparationEvaluation(result);
+    } catch (error) {
+      setPreparationError(error.message);
+    } finally {
+      setPreparationBusy("");
+    }
+  }
+
+  async function handleOpenPracticeHistory(sessionId) {
+    setPracticeHistoryBusy(true);
+    setPracticeHistoryError("");
+    setPracticeQuestionHistory(null);
+    try {
+      const result = await getPreparationHistory(sessionId);
+      setPracticeHistory(result);
+    } catch (error) {
+      setPracticeHistoryError(error.message);
+    } finally {
+      setPracticeHistoryBusy(false);
+    }
+  }
+
+  async function handleOpenPracticeQuestion(questionId) {
+    setPracticeHistoryBusy(true);
+    setPracticeHistoryError("");
+    try {
+      const result = await getPreparationQuestionHistory(questionId);
+      setPracticeQuestionHistory(result);
+    } catch (error) {
+      setPracticeHistoryError(error.message);
+    } finally {
+      setPracticeHistoryBusy(false);
+    }
+  }
+
+  async function handleSubmitPracticeHistoryAnswer(questionId, answer) {
+    setPracticeAttemptBusy(true);
+    setPracticeAttemptError("");
+    let result;
+    try {
+      result = await submitHistoricalPreparationAnswer(questionId, answer);
+    } catch (error) {
+      setPracticeAttemptError(error.message);
+      setPracticeAttemptBusy(false);
+      return false;
+    }
+
+    let evaluationError = "";
+    try {
+      await reevaluateHistoricalPreparationAnswer(result.answer_id);
+    } catch (error) {
+      evaluationError = error.message;
+    }
+
+    try {
+      const detail = await getPreparationQuestionHistory(questionId);
+      setPracticeQuestionHistory(detail);
+    } catch (error) {
+      setPracticeAttemptError(
+        `Answer saved, but history could not be refreshed: ${error.message}`
+      );
+      return true;
+    } finally {
+      setPracticeAttemptBusy(false);
+    }
+    if (evaluationError) {
+      setPracticeAttemptError(
+        `Answer saved, but evaluation failed: ${evaluationError}`
+      );
+    }
+    setPracticeAttemptBusy(false);
+    return true;
+  }
+
+  async function handleReevaluatePracticeAnswer(questionId, answerId) {
+    setPracticeReevaluatingAnswerId(answerId);
+    setPracticeReevaluationError("");
+    try {
+      await reevaluateHistoricalPreparationAnswer(answerId);
+      const detail = await getPreparationQuestionHistory(questionId);
+      setPracticeQuestionHistory(detail);
+    } catch (error) {
+      setPracticeReevaluationError(
+        error.message || "Could not re-evaluate this answer."
+      );
+    } finally {
+      setPracticeReevaluatingAnswerId("");
+    }
+  }
+
+  async function handleLoadInterviewHistory() {
+    if (!resume?.resume_id) return;
+    setInterviewHistoryBusy(true);
+    setInterviewHistoryError("");
+    setInterviewHistorySession(null);
+    setInterviewQuestionHistory(null);
+    try {
+      const result = await getInterviewHistory(resume.resume_id);
+      setInterviewHistory(result.sessions || []);
+    } catch (error) {
+      setInterviewHistoryError(error.message);
+    } finally {
+      setInterviewHistoryBusy(false);
+    }
+  }
+
+  async function handleOpenInterviewHistory(sessionId) {
+    setInterviewHistoryBusy(true);
+    setInterviewHistoryError("");
+    setInterviewQuestionHistory(null);
+    try {
+      const result = await getInterviewHistorySession(sessionId);
+      setInterviewHistorySession(result);
+    } catch (error) {
+      setInterviewHistoryError(error.message);
+    } finally {
+      setInterviewHistoryBusy(false);
+    }
+  }
+
+  async function handleOpenInterviewQuestion(questionId) {
+    setInterviewHistoryBusy(true);
+    setInterviewHistoryError("");
+    try {
+      const result = await getInterviewQuestionHistory(questionId);
+      setInterviewQuestionHistory(result);
+    } catch (error) {
+      setInterviewHistoryError(error.message);
+    } finally {
+      setInterviewHistoryBusy(false);
+    }
+  }
+
+  async function handleSubmitInterviewHistoryAnswer(questionId, answer) {
+    setInterviewAttemptBusy(true);
+    setInterviewAttemptError("");
+    let result;
+    try {
+      result = await submitHistoricalInterviewAnswer(questionId, answer);
+    } catch (error) {
+      setInterviewAttemptError(error.message);
+      setInterviewAttemptBusy(false);
+      return false;
+    }
+
+    let evaluationError = "";
+    try {
+      await reevaluateHistoricalInterviewAnswer(result.answer_id);
+    } catch (error) {
+      evaluationError = error.message;
+    }
+
+    try {
+      const detail = await getInterviewQuestionHistory(questionId);
+      setInterviewQuestionHistory(detail);
+    } catch (error) {
+      setInterviewAttemptError(
+        `Answer saved, but history could not be refreshed: ${error.message}`
+      );
+      setInterviewAttemptBusy(false);
+      return true;
+    }
+    if (evaluationError) {
+      setInterviewAttemptError(
+        `Answer saved, but evaluation failed: ${evaluationError}`
+      );
+    }
+    setInterviewAttemptBusy(false);
+    return true;
+  }
+
+  async function handleReevaluateInterviewAnswer(questionId, answerId) {
+    setInterviewReevaluatingAnswerId(answerId);
+    setInterviewReevaluationError("");
+    try {
+      await reevaluateHistoricalInterviewAnswer(answerId);
+      const detail = await getInterviewQuestionHistory(questionId);
+      setInterviewQuestionHistory(detail);
+    } catch (error) {
+      setInterviewReevaluationError(
+        error.message || "Could not re-evaluate this answer."
+      );
+    } finally {
+      setInterviewReevaluatingAnswerId("");
     }
   }
 
@@ -516,6 +965,281 @@ export default function Home() {
               </div>
             )}
             <ErrorMessage>{interviewError}</ErrorMessage>
+          </section>
+
+          <section className="panel tool-panel">
+            <div className="section-heading">
+              <span className="step-number">04</span>
+              <div>
+                <h2>DSA, SQL &amp; HR practice</h2>
+                <p>Practice focused questions and get structured feedback.</p>
+              </div>
+            </div>
+
+            <div className="answer-form">
+              <label htmlFor="preparation-mode">Practice mode</label>
+              <select
+                id="preparation-mode"
+                value={preparationMode}
+                onChange={handlePreparationModeChange}
+                disabled={Boolean(preparationBusy)}
+              >
+                <option value="dsa">DSA</option>
+                <option value="sql">SQL</option>
+                <option value="hr">HR</option>
+              </select>
+              <label htmlFor="preparation-topic">Optional topic</label>
+              <input
+                id="preparation-topic"
+                type="text"
+                value={preparationTopic}
+                onChange={(event) => setPreparationTopic(event.target.value)}
+                placeholder="e.g. graphs, joins, teamwork"
+                maxLength="200"
+                disabled={Boolean(preparationBusy)}
+              />
+              <button
+                className="button button-primary button-full"
+                type="button"
+                onClick={handleGeneratePreparationQuestion}
+                disabled={Boolean(preparationBusy)}
+              >
+                {preparationBusy === "question"
+                  ? "Generating question…"
+                  : preparationQuestion
+                    ? "Generate next question"
+                    : "Generate question"}
+              </button>
+            </div>
+
+            {preparationBusy === "evaluate" && (
+              <div className="evaluation-loading" role="status" aria-live="polite">
+                <span className="loading-spinner" aria-hidden="true" />
+                Submitting and evaluating your answer…
+              </div>
+            )}
+
+            {preparationQuestion && (
+              <div className="interview-session">
+                <div className="question-card">
+                  <span className="question-label">
+                    {preparationMode.toUpperCase()} QUESTION
+                  </span>
+                  <h3>{preparationQuestion.question}</h3>
+                </div>
+                <form
+                  onSubmit={handleEvaluatePreparationAnswer}
+                  className="answer-form"
+                >
+                  <label htmlFor="preparation-answer">Your answer</label>
+                  <textarea
+                    id="preparation-answer"
+                    value={preparationAnswer}
+                    onChange={(event) => setPreparationAnswer(event.target.value)}
+                    placeholder="Write your answer…"
+                    rows="4"
+                    maxLength="5000"
+                    disabled={Boolean(preparationBusy)}
+                  />
+                  <button
+                    className="button button-dark button-full"
+                    type="submit"
+                    disabled={!preparationAnswer.trim() || Boolean(preparationBusy)}
+                  >
+                    {preparationBusy === "evaluate"
+                      ? "Submitting answer…"
+                      : "Submit & evaluate"}
+                  </button>
+                </form>
+              </div>
+            )}
+
+            {preparationEvaluation && preparationBusy !== "evaluate" && (
+              <section className="evaluation-card" aria-live="polite">
+                <div className="score-row">
+                  <div>
+                    <span className="question-label">ANSWER FEEDBACK</span>
+                    <h3>Practice coaching</h3>
+                  </div>
+                  <div className="score-badge">
+                    <strong>{preparationEvaluation.score}</strong>
+                    <span>/100</span>
+                  </div>
+                </div>
+                <div className="feedback-columns">
+                  <div>
+                    <h4>Strengths</h4>
+                    <ul>
+                      {preparationEvaluation.strengths.map((item, index) => (
+                        <li key={`${index}-${item}`}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div>
+                    <h4>Opportunities</h4>
+                    <ul>
+                      {preparationEvaluation.improvements.map((item, index) => (
+                        <li key={`${index}-${item}`}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+                <div className="sample-answer">
+                  <h4>Suggested answer / explanation</h4>
+                  <p>{preparationEvaluation.suggested_answer}</p>
+                </div>
+              </section>
+            )}
+            <ErrorMessage>{preparationError}</ErrorMessage>
+          </section>
+
+          <section className="panel tool-panel">
+            <div className="section-heading">
+              <span className="step-number">05</span>
+              <div>
+                <h2>Practice history</h2>
+                <p>Revisit saved DSA, SQL, and HR sessions.</p>
+              </div>
+            </div>
+            {practiceHistoryIds.length === 0 ? (
+              <p className="helper-note">Generated practice sessions will appear here.</p>
+            ) : (
+              <div className="answer-form">
+                {practiceHistoryIds.map((item) => (
+                  <button
+                    className="button button-outline"
+                    key={item.session_id}
+                    type="button"
+                    onClick={() => handleOpenPracticeHistory(item.session_id)}
+                    disabled={practiceHistoryBusy}
+                  >
+                    {item.mode.toUpperCase()} session · {item.session_id.slice(0, 8)}
+                  </button>
+                ))}
+              </div>
+            )}
+            {practiceHistoryBusy && (
+              <p className="loading-note" role="status">Loading practice history…</p>
+            )}
+            <ErrorMessage>{practiceHistoryError}</ErrorMessage>
+            {practiceHistory && (
+              <div className="interview-session">
+                <div className="question-card">
+                  <span className="question-label">
+                    {practiceHistory.mode?.toUpperCase()} SESSION
+                  </span>
+                  <p>{practiceHistory.session_id}</p>
+                </div>
+                <div className="answer-form">
+                  {practiceHistory.questions.map((item) => (
+                    <button
+                      className="button button-outline"
+                      key={item.question_id}
+                      type="button"
+                      onClick={() => handleOpenPracticeQuestion(item.question_id)}
+                      disabled={practiceHistoryBusy}
+                    >
+                      Question {item.ordinal}: {item.question}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {practiceQuestionHistory && (
+              <HistoryQuestionDetails
+                item={practiceQuestionHistory}
+                onSubmitAnswer={(value) =>
+                  handleSubmitPracticeHistoryAnswer(
+                    practiceQuestionHistory.question_id,
+                    value
+                  )
+                }
+                submitting={practiceAttemptBusy}
+                error={practiceAttemptError}
+                onReevaluate={(answerId) =>
+                  handleReevaluatePracticeAnswer(
+                    practiceQuestionHistory.question_id,
+                    answerId
+                  )
+                }
+                reevaluatingAnswerId={practiceReevaluatingAnswerId}
+                reevaluationError={practiceReevaluationError}
+              />
+            )}
+          </section>
+
+          <section className="panel tool-panel">
+            <div className="section-heading">
+              <span className="step-number">06</span>
+              <div>
+                <h2>Mock interview history</h2>
+                <p>Review previous questions, answers, and feedback.</p>
+              </div>
+            </div>
+            <button
+              className="button button-primary"
+              type="button"
+              onClick={handleLoadInterviewHistory}
+              disabled={!resume || interviewHistoryBusy}
+            >
+              {interviewHistoryBusy ? "Loading history…" : "Load interview history"}
+            </button>
+            {!resume && (
+              <p className="helper-note">Upload the resume used for an interview to view its history.</p>
+            )}
+            {interviewHistory.map((item) => (
+              <button
+                className="button button-outline"
+                key={item.session_id}
+                type="button"
+                onClick={() => handleOpenInterviewHistory(item.session_id)}
+                disabled={interviewHistoryBusy}
+              >
+                Interview · {new Date(item.created_at).toLocaleString()} · {item.question_count} questions
+              </button>
+            ))}
+            {interviewHistoryBusy && (
+              <p className="loading-note" role="status">Loading interview history…</p>
+            )}
+            <ErrorMessage>{interviewHistoryError}</ErrorMessage>
+            {interviewHistorySession && (
+              <div className="interview-session">
+                <div className="answer-form">
+                  {interviewHistorySession.questions.map((item) => (
+                    <button
+                      className="button button-outline"
+                      key={item.question_id}
+                      type="button"
+                      onClick={() => handleOpenInterviewQuestion(item.question_id)}
+                      disabled={interviewHistoryBusy}
+                    >
+                      Question {item.ordinal}: {item.question}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {interviewQuestionHistory && (
+              <HistoryQuestionDetails
+                item={interviewQuestionHistory}
+                onSubmitAnswer={(value) =>
+                  handleSubmitInterviewHistoryAnswer(
+                    interviewQuestionHistory.question_id,
+                    value
+                  )
+                }
+                submitting={interviewAttemptBusy}
+                error={interviewAttemptError}
+                onReevaluate={(answerId) =>
+                  handleReevaluateInterviewAnswer(
+                    interviewQuestionHistory.question_id,
+                    answerId
+                  )
+                }
+                reevaluatingAnswerId={interviewReevaluatingAnswerId}
+                reevaluationError={interviewReevaluationError}
+              />
+            )}
           </section>
         </div>
       </div>

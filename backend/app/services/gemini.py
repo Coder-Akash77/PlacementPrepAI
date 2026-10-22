@@ -4,10 +4,20 @@ import re
 
 from google import genai
 from google.genai.errors import APIError
+from google.genai.types import HttpOptions, HttpRetryOptions
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+_GEMINI_RETRY_OPTIONS = {
+    "attempts": 3,
+    "initial_delay": 0.2,
+    "max_delay": 0.5,
+    "exp_base": 2,
+    "jitter": 0.1,
+    "http_status_codes": [503],
+}
 
 
 class GeminiConfigurationError(RuntimeError):
@@ -31,6 +41,10 @@ def _safe_error_message(error: APIError) -> str:
     return message
 
 
+def _gemini_http_options() -> HttpOptions:
+    return HttpOptions(retry_options=HttpRetryOptions(**_GEMINI_RETRY_OPTIONS))
+
+
 def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
     if not settings.GEMINI_API_KEY:
         raise GeminiConfigurationError("Gemini API key is not configured.")
@@ -48,7 +62,10 @@ def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
     )
 
     try:
-        with genai.Client(api_key=settings.GEMINI_API_KEY) as client:
+        with genai.Client(
+            api_key=settings.GEMINI_API_KEY,
+            http_options=_gemini_http_options(),
+        ) as client:
             response = client.models.generate_content(
                 model=settings.GEMINI_MODEL,
                 contents=prompt,
@@ -75,10 +92,14 @@ def generate_interview_question(
         f"[{chunk['section']}]\n{chunk['text']}" for chunk in resume_chunks
     )
     prompt = (
-        "Generate exactly one concise mock interview question at a time. "
-        "Base it on the candidate's retrieved resume context and do not assume "
-        "qualifications that are not present. Do not answer the question or add "
-        "numbering or commentary. Avoid repeating prior questions.\n\n"
+        "Generate exactly one clear, realistic placement-level mock interview "
+        "question at a time. Use understandable wording suitable for both "
+        "beginners and placement-ready candidates; adjust complexity to the "
+        "candidate's retrieved resume context. Ask about a skill, project, "
+        "decision, or experience supported by that context. Do not assume "
+        "qualifications or experience that are not present. Do not include an "
+        "answer, hints that reveal an answer, numbering, or commentary. Avoid "
+        "repeating prior questions.\n\n"
         f"Retrieved resume context:\n{context or '(No relevant resume information found.)'}"
         f"\n\nPrior questions:\n{json.dumps(previous_questions)}"
     )
@@ -92,13 +113,18 @@ def evaluate_interview_answer(
         f"[{chunk['section']}]\n{chunk['text']}" for chunk in resume_chunks
     )
     prompt = (
-        "Evaluate the candidate's interview answer. Ground resume-specific "
-        "feedback in the retrieved resume context; never invent qualifications "
-        "or experience. Return only a JSON object with exactly these fields: "
+        "Evaluate the candidate's interview answer fairly for a placement "
+        "interview, using clear language suitable for both beginners and "
+        "placement-ready candidates. Explain specific mistakes, unsupported "
+        "claims, or important omissions in the improvements, and give concrete "
+        "next steps. Ground resume-specific feedback in the retrieved resume "
+        "context; never invent qualifications or experience. The improved "
+        "sample should demonstrate stronger structure and detail without adding "
+        "personal facts not provided in the answer or resume context. Return "
+        "only a JSON object with exactly these fields: "
         '"score" (integer 0-100), "strengths" (non-empty array of strings), '
         '"improvements" (non-empty array of strings), and '
-        '"improved_sample_answer" (string). The sample may improve framing but '
-        "must not add unsupported personal facts.\n\n"
+        '"improved_sample_answer" (string).\n\n'
         f"Retrieved resume context:\n{context or '(No relevant resume information found.)'}"
         f"\n\nInterview question:\n{question}\n\nCandidate answer:\n{answer}"
     )
@@ -114,16 +140,34 @@ def evaluate_interview_answer(
 
 def generate_preparation_question(mode: str, topic: str | None = None) -> str:
     mode_instructions = {
-        "dsa": "Focus on algorithms and data structures. Ask one problem-solving question.",
-        "sql": "Focus on SQL concepts or query-writing. Ask one clear question.",
-        "hr": "Focus on behavioral and interpersonal interview preparation. Ask one behavioral question.",
+        "dsa": (
+            "Ask one realistic algorithms or data-structures placement problem. "
+            "State the task clearly and include relevant input constraints plus "
+            "a small input/output example when useful. Explain any ambiguous "
+            "terms briefly. Do not include the algorithm, solution, hints, or "
+            "answer; the candidate must attempt it first."
+        ),
+        "sql": (
+            "Ask one realistic SQL placement question. Include a sufficient "
+            "table schema with column names and relevant types or relationships, "
+            "the exact task, and the expected result columns or format when "
+            "useful. Do not include a query or solution."
+        ),
+        "hr": (
+            "Ask one specific, understandable behavioral or situational "
+            "placement-interview question. Give enough scenario context to make "
+            "clear what the candidate should address, without suggesting an "
+            "answer."
+        ),
     }
     if mode not in mode_instructions:
         raise ValueError("Unsupported preparation mode.")
 
     prompt = (
-        f"{mode_instructions[mode]} Generate exactly one question with no answer "
-        "or extra commentary."
+        "Use clear wording and a reasonable difficulty for both beginners and "
+        "placement-ready students; make the task realistic without needless "
+        "trickiness. Generate exactly one question and no extra commentary. "
+        f"{mode_instructions[mode]}"
     )
     if topic:
         prompt += f"\nFocus topic: {topic}"
@@ -132,15 +176,34 @@ def generate_preparation_question(mode: str, topic: str | None = None) -> str:
 
 def evaluate_preparation_answer(mode: str, question: str, answer: str) -> dict:
     mode_instructions = {
-        "dsa": "Assess algorithmic correctness, data-structure choices, and complexity.",
-        "sql": "Assess SQL correctness, query reasoning, and relevant database concepts.",
-        "hr": "Assess behavioral response clarity, relevance, and communication.",
+        "dsa": (
+            "Assess correctness, algorithm and data-structure choices, edge "
+            "cases, and time/space complexity when relevant. Explain each "
+            "important mistake or omission in beginner-friendly terms."
+        ),
+        "sql": (
+            "Assess whether the query or explanation satisfies the task and "
+            "schema, including joins, filtering, grouping, and edge cases when "
+            "relevant. Explain specific SQL mistakes or omissions clearly."
+        ),
+        "hr": (
+            "Assess whether the behavioral answer addresses the scenario, "
+            "explains the candidate's actions, and communicates outcomes "
+            "clearly. Identify missing details and practical improvements."
+        ),
     }
     if mode not in mode_instructions:
         raise ValueError("Unsupported preparation mode.")
 
     prompt = (
-        f"{mode_instructions[mode]} Evaluate the submitted answer to the question. "
+        "Evaluate the submitted answer fairly using clear language suitable "
+        "for both beginners and placement-ready students. "
+        f"{mode_instructions[mode]} Give specific, actionable next steps in "
+        "improvements and a useful improved answer or explanation that "
+        "corrects the identified issues. Never invent personal experience or "
+        "facts; for HR, clearly present any example as a template to adapt. "
+        "Evaluate only after the submitted attempt; do not treat the suggested "
+        "answer as part of the question. "
         "Return only a JSON object with exactly these fields: "
         '"score" (integer from 0 to 100), "strengths" (non-empty array of strings), '
         '"improvements" (non-empty array of strings), and '
@@ -165,7 +228,10 @@ def _generate_text(prompt: str, response_mime_type: str | None = None) -> str:
 
     config = {"response_mime_type": response_mime_type} if response_mime_type else None
     try:
-        with genai.Client(api_key=settings.GEMINI_API_KEY) as client:
+        with genai.Client(
+            api_key=settings.GEMINI_API_KEY,
+            http_options=_gemini_http_options(),
+        ) as client:
             response = client.models.generate_content(
                 model=settings.GEMINI_MODEL,
                 contents=prompt,

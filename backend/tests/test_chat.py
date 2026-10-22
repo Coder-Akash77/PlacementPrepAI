@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+import httpx
 from fastapi.testclient import TestClient
 from google.genai.errors import ClientError
 
@@ -99,8 +100,9 @@ class ChatTests(unittest.TestCase):
                 return FakeResponse()
 
         class FakeClient:
-            def __init__(self, api_key):
+            def __init__(self, api_key, http_options=None):
                 self.api_key = api_key
+                self.http_options = http_options
                 self.models = FakeModels()
 
             def __enter__(self):
@@ -145,7 +147,7 @@ class ChatTests(unittest.TestCase):
                 )
 
         class FakeClient:
-            def __init__(self, api_key):
+            def __init__(self, api_key, http_options=None):
                 self.models = FakeModels()
 
             def __enter__(self):
@@ -166,6 +168,107 @@ class ChatTests(unittest.TestCase):
         self.assertIn("NOT_FOUND", captured.output[0])
         self.assertIn("Model unavailable", captured.output[0])
         self.assertNotIn("test-secret", captured.output[0])
+
+    def test_gemini_sdk_retries_transient_503_then_succeeds(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(
+                    503,
+                    json={
+                        "error": {
+                            "code": 503,
+                            "status": "UNAVAILABLE",
+                            "message": "Temporarily busy.",
+                        }
+                    },
+                    request=request,
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {"content": {"parts": [{"text": "A practice question."}]}}
+                    ]
+                },
+                request=request,
+            )
+
+        options = gemini._gemini_http_options()
+        options.client_args = {"transport": httpx.MockTransport(respond)}
+        with (
+            patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
+            patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
+            patch.object(gemini, "_gemini_http_options", return_value=options),
+        ):
+            result = gemini.generate_preparation_question("dsa")
+
+        self.assertEqual(result, "A practice question.")
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(options.retry_options.http_status_codes, [503])
+        self.assertEqual(options.retry_options.attempts, 3)
+
+    def test_gemini_sdk_503_retries_exhausted_map_to_generation_error(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(
+                503,
+                json={
+                    "error": {
+                        "code": 503,
+                        "status": "UNAVAILABLE",
+                        "message": "Temporarily busy.",
+                    }
+                },
+                request=request,
+            )
+
+        options = gemini._gemini_http_options()
+        options.client_args = {"transport": httpx.MockTransport(respond)}
+        with (
+            patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
+            patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
+            patch.object(gemini, "_gemini_http_options", return_value=options),
+            self.assertLogs(gemini.logger, level="WARNING"),
+        ):
+            with self.assertRaises(GeminiGenerationError):
+                gemini.generate_preparation_question("sql")
+
+        self.assertEqual(len(requests), 3)
+
+    def test_gemini_sdk_does_not_retry_authentication_errors(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(
+                401,
+                json={
+                    "error": {
+                        "code": 401,
+                        "status": "UNAUTHENTICATED",
+                        "message": "Invalid credentials.",
+                    }
+                },
+                request=request,
+            )
+
+        options = gemini._gemini_http_options()
+        options.client_args = {"transport": httpx.MockTransport(respond)}
+        with (
+            patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
+            patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
+            patch.object(gemini, "_gemini_http_options", return_value=options),
+            self.assertLogs(gemini.logger, level="WARNING"),
+        ):
+            with self.assertRaises(GeminiGenerationError):
+                gemini.generate_preparation_question("hr")
+
+        self.assertEqual(len(requests), 1)
 
 
 if __name__ == "__main__":
