@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: placementprepai-backend
+    runtime: python
+    rootDir: backend
+    plan: 0.5c-512mb
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: CHROMA_DIR
+        value: /var/data/chroma
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+      - key: HISTORY_DB_PATH
+        value: /var/data/history.db
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FRONTEND_ORIGINS
+        sync: false
+    disk:
+      name: placementprepai-data
+      mountPath: /var/data
+
+  - type: web
+    name: placementprepai-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_URL
+        sync: false
