@@ -1,16 +1,20 @@
+from __future__ import annotations
+
 import re
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import chromadb
 from chromadb.errors import NotFoundError
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
-from sentence_transformers import SentenceTransformer
 
 from app.config import settings
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 SECTION_ALIASES = {
     "Skills": {"skills", "technical skills", "core competencies"},
@@ -126,6 +130,8 @@ def chunk_text(
 
 @lru_cache(maxsize=1)
 def _get_embedding_model() -> SentenceTransformer:
+    from sentence_transformers import SentenceTransformer
+
     return SentenceTransformer(settings.EMBEDDING_MODEL)
 
 
