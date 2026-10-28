@@ -12,6 +12,7 @@ import chromadb
 from chromadb.errors import NotFoundError
 from google import genai
 from google.genai.errors import APIError
+from google.genai import types
 from google.genai.types import EmbedContentConfig, HttpOptions, HttpRetryOptions
 from httpx import HTTPError
 from pypdf import PdfReader
@@ -166,8 +167,15 @@ def _collection_name(resume_id: str) -> str:
 
 
 def _normalized_embedding(values: list[float] | None) -> list[float]:
-    if values is None or len(values) != EMBEDDING_DIMENSIONS:
-        raise ResumeEmbeddingError("Gemini returned an invalid embedding.")
+    if values is None:
+        raise ResumeEmbeddingError(
+            "Gemini returned an embedding without vector values."
+        )
+    if len(values) != EMBEDDING_DIMENSIONS:
+        raise ResumeEmbeddingError(
+            f"Gemini returned an embedding with {len(values)} dimensions; "
+            f"expected {EMBEDDING_DIMENSIONS}."
+        )
     try:
         vector = [float(value) for value in values]
     except (TypeError, ValueError) as exc:
@@ -185,6 +193,8 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
         raise ResumeEmbeddingConfigurationError(
             "Gemini API key is not configured."
         )
+    if not texts:
+        return []
 
     embeddings = []
     try:
@@ -206,18 +216,29 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
                 batch = texts[start : start + EMBEDDING_BATCH_SIZE]
                 response = client.models.embed_content(
                     model=EMBEDDING_MODEL,
-                    contents=batch,
+                    contents=[
+                        types.Content(
+                            parts=[types.Part.from_text(text=text)],
+                            role="user",
+                        )
+                        for text in batch
+                    ],
                     config=EmbedContentConfig(
                         output_dimensionality=EMBEDDING_DIMENSIONS
                     ),
                 )
-                batch_embeddings = response.embeddings or []
+                batch_embeddings = getattr(response, "embeddings", None) or []
                 if len(batch_embeddings) != len(batch):
+                    embedding_word = (
+                        "embedding" if len(batch_embeddings) == 1 else "embeddings"
+                    )
+                    text_word = "input text" if len(batch) == 1 else "input texts"
                     raise ResumeEmbeddingError(
-                        "Gemini returned an invalid embedding response."
+                        f"Gemini returned {len(batch_embeddings)} {embedding_word} "
+                        f"for {len(batch)} {text_word}."
                     )
                 embeddings.extend(
-                    _normalized_embedding(embedding.values)
+                    _normalized_embedding(getattr(embedding, "values", None))
                     for embedding in batch_embeddings
                 )
     except (APIError, HTTPError, TimeoutError) as exc:

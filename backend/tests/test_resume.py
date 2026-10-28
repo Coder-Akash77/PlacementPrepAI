@@ -6,6 +6,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+from google.genai import types
 from httpx import ReadTimeout
 from pypdf.errors import PdfReadError
 
@@ -17,18 +18,23 @@ from app.services import resume as resume_service
 class FakeGeminiModels:
     def __init__(self):
         self.requests = []
+        self.response_embeddings = None
+        self.response_missing_embeddings = False
 
     def embed_content(self, model, contents, config):
         self.requests.append(
             {"model": model, "contents": contents, "config": config}
         )
-        texts = contents if isinstance(contents, list) else [contents]
-        return SimpleNamespace(
-            embeddings=[
+        count = len(contents) if isinstance(contents, list) else 1
+        embeddings = self.response_embeddings
+        if embeddings is None:
+            embeddings = [
                 SimpleNamespace(values=[3.0, 4.0] + [0.0] * 766)
-                for _ in texts
+                for _ in range(count)
             ]
-        )
+        if self.response_missing_embeddings:
+            return SimpleNamespace()
+        return SimpleNamespace(embeddings=embeddings)
 
 
 class FakeGeminiClient:
@@ -206,23 +212,74 @@ class ResumeTests(unittest.TestCase):
             1.0,
         )
         self.assertEqual(
-            self.gemini.models.requests[0]["contents"],
+            [
+                content.parts[0].text
+                for content in self.gemini.models.requests[0]["contents"]
+            ],
             [
                 "title: Skills | text: Python and Java",
                 "title: Education | text: Computer Science degree",
             ],
         )
         self.assertEqual(
+            len(self.gemini.models.requests[0]["contents"]),
+            2,
+        )
+        self.assertTrue(
+            all(
+                isinstance(content, types.Content)
+                and len(content.parts) == 1
+                and isinstance(content.parts[0], types.Part)
+                for content in self.gemini.models.requests[0]["contents"]
+            )
+        )
+        self.assertEqual(
             self.gemini.models.requests[0]["config"].output_dimensionality, 768
         )
         self.assertEqual(
-            self.gemini.models.requests[1]["contents"],
-            ["task: question answering | query: degree"],
+            self.gemini.models.requests[1]["contents"][0].parts[0].text,
+            "task: question answering | query: degree",
         )
         self.assertEqual(
             collection.last_query_embeddings[0],
             collection.documents[0]["embedding"],
         )
+
+    def test_embedding_response_count_mismatch_has_safe_error(self):
+        self.gemini.models.response_embeddings = [
+            SimpleNamespace(values=[3.0, 4.0] + [0.0] * 766)
+        ]
+        with self.assertRaisesRegex(
+            resume_service.ResumeEmbeddingError,
+            "returned 1 embedding for 2 input texts",
+        ):
+            resume_service._embed_texts(["First chunk", "Second chunk"])
+
+    def test_embedding_response_with_missing_embeddings_is_rejected(self):
+        self.gemini.models.response_embeddings = []
+        with self.assertRaisesRegex(
+            resume_service.ResumeEmbeddingError,
+            "returned 0 embeddings for 1 input text",
+        ):
+            resume_service._embed_texts(["A resume chunk"])
+
+    def test_embedding_response_missing_embeddings_is_rejected(self):
+        self.gemini.models.response_missing_embeddings = True
+        with self.assertRaisesRegex(
+            resume_service.ResumeEmbeddingError,
+            "returned 0 embeddings for 2 input texts",
+        ):
+            resume_service._embed_texts(["First chunk", "Second chunk"])
+
+    def test_embedding_with_wrong_dimensions_is_rejected(self):
+        self.gemini.models.response_embeddings = [
+            SimpleNamespace(values=[1.0, 0.0])
+        ]
+        with self.assertRaisesRegex(
+            resume_service.ResumeEmbeddingError,
+            "2 dimensions; expected 768",
+        ):
+            resume_service._embed_texts(["A resume chunk"])
 
     def test_incompatible_existing_index_is_rebuilt_on_upload(self):
         resume_id = str(uuid4())
