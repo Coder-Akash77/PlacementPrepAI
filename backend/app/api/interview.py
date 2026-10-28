@@ -20,7 +20,13 @@ from app.services.interview import (
     set_next_question,
     submit_answer,
 )
-from app.services.resume import ResumeIndexNotFound, search_resume
+from app.services.resume import (
+    ResumeEmbeddingConfigurationError,
+    ResumeEmbeddingError,
+    ResumeIndexIncompatible,
+    ResumeIndexNotFound,
+    search_resume,
+)
 
 router = APIRouter(prefix="/interview", tags=["interview"])
 
@@ -88,6 +94,12 @@ def _evaluate(question: str, answer: str, resume_id: str) -> InterviewEvaluation
         chunks = search_resume(resume_id, question)
     except ResumeIndexNotFound as exc:
         raise HTTPException(status_code=404, detail="Resume not found.") from exc
+    except ResumeIndexIncompatible as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ResumeEmbeddingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ResumeEmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     try:
         raw_evaluation = evaluate_interview_answer(question, answer, chunks)
@@ -106,6 +118,12 @@ def _generate_question(resume_id: str, questions: list[str]) -> str:
         chunks = search_resume(resume_id, retrieval_query)
     except ResumeIndexNotFound as exc:
         raise HTTPException(status_code=404, detail="Resume not found.") from exc
+    except ResumeIndexIncompatible as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ResumeEmbeddingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ResumeEmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     try:
         return generate_interview_question(chunks, questions)

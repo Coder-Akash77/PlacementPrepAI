@@ -18,7 +18,6 @@ class Settings:
         if origin.strip()
     ]
 
-    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     CHROMA_DIR: str = os.getenv("CHROMA_DIR", "./data/chroma")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "./data/uploads")
     HISTORY_DB_PATH: str = os.getenv("HISTORY_DB_PATH", "./data/history.db")

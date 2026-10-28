@@ -8,7 +8,13 @@ from app.services.gemini import (
     GeminiGenerationError,
     answer_resume_question,
 )
-from app.services.resume import ResumeIndexNotFound, search_resume
+from app.services.resume import (
+    ResumeEmbeddingConfigurationError,
+    ResumeEmbeddingError,
+    ResumeIndexIncompatible,
+    ResumeIndexNotFound,
+    search_resume,
+)
 
 router = APIRouter(tags=["chat"])
 
@@ -32,6 +38,12 @@ def chat(request: ChatRequest):
         chunks = search_resume(str(request.resume_id), request.question)
     except ResumeIndexNotFound as exc:
         raise HTTPException(status_code=404, detail="Resume not found.") from exc
+    except ResumeIndexIncompatible as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ResumeEmbeddingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ResumeEmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     try:
         answer = answer_resume_question(request.question, chunks)

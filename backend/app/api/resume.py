@@ -5,6 +5,9 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
 from app.services.resume import (
     PDFProcessingError,
+    ResumeEmbeddingConfigurationError,
+    ResumeEmbeddingError,
+    ResumeIndexIncompatible,
     ResumeIndexNotFound,
     chunk_text,
     extract_pdf_text,
@@ -32,7 +35,12 @@ async def upload_resume(file: UploadFile = File(...)):
 
     chunks = chunk_text(text)
     resume_id = str(uuid4())
-    index_resume(resume_id, chunks)
+    try:
+        index_resume(resume_id, chunks)
+    except ResumeEmbeddingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ResumeEmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     save_uploaded_pdf(resume_id, content)
     return {
         "resume_id": resume_id,
@@ -52,4 +60,10 @@ def search_resumes(
         results = search_resume(str(resume_id), query, top_k=top_k, section=section)
     except ResumeIndexNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ResumeIndexIncompatible as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ResumeEmbeddingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ResumeEmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"resume_id": str(resume_id), "query": query, "results": results}

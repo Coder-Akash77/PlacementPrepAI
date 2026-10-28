@@ -1,20 +1,25 @@
 from __future__ import annotations
 
+import logging
+import math
 import re
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import chromadb
 from chromadb.errors import NotFoundError
+from google import genai
+from google.genai.errors import APIError
+from google.genai.types import EmbedContentConfig, HttpOptions, HttpRetryOptions
+from httpx import HTTPError
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from app.config import settings
 
-if TYPE_CHECKING:
-    from sentence_transformers import SentenceTransformer
+logger = logging.getLogger(__name__)
 
 SECTION_ALIASES = {
     "Skills": {"skills", "technical skills", "core competencies"},
@@ -30,6 +35,17 @@ SECTION_ALIASES = {
 }
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_CHUNK_OVERLAP = 150
+EMBEDDING_MODEL = "gemini-embedding-2"
+EMBEDDING_DIMENSIONS = 768
+EMBEDDING_BATCH_SIZE = 32
+EMBEDDING_TIMEOUT_MS = 20_000
+EMBEDDING_NORMALIZATION = "l2"
+_EMBEDDING_METADATA = {
+    "embedding_provider": "google",
+    "embedding_model": EMBEDDING_MODEL,
+    "embedding_dimensions": EMBEDDING_DIMENSIONS,
+    "embedding_normalization": EMBEDDING_NORMALIZATION,
+}
 
 
 class PDFProcessingError(ValueError):
@@ -38,6 +54,18 @@ class PDFProcessingError(ValueError):
 
 class ResumeIndexNotFound(LookupError):
     """Raised when a resume has no stored vector index."""
+
+
+class ResumeEmbeddingError(RuntimeError):
+    """Raised when the hosted embedding service cannot create embeddings."""
+
+
+class ResumeEmbeddingConfigurationError(ResumeEmbeddingError):
+    """Raised when Gemini embeddings are not configured."""
+
+
+class ResumeIndexIncompatible(RuntimeError):
+    """Raised when a stored resume index uses incompatible embeddings."""
 
 
 def extract_pdf_text(content: bytes) -> str:
@@ -129,13 +157,6 @@ def chunk_text(
 
 
 @lru_cache(maxsize=1)
-def _get_embedding_model() -> SentenceTransformer:
-    from sentence_transformers import SentenceTransformer
-
-    return SentenceTransformer(settings.EMBEDDING_MODEL)
-
-
-@lru_cache(maxsize=1)
 def _get_chroma_client() -> chromadb.ClientAPI:
     return chromadb.PersistentClient(path=settings.CHROMA_DIR)
 
@@ -144,14 +165,131 @@ def _collection_name(resume_id: str) -> str:
     return f"resume_{resume_id.replace('-', '')}"
 
 
-def index_resume(resume_id: str, chunks: list[dict[str, Any]]) -> None:
-    model = _get_embedding_model()
-    embeddings = model.encode([chunk["text"] for chunk in chunks]).tolist()
-    collection = _get_chroma_client().get_or_create_collection(
+def _normalized_embedding(values: list[float] | None) -> list[float]:
+    if values is None or len(values) != EMBEDDING_DIMENSIONS:
+        raise ResumeEmbeddingError("Gemini returned an invalid embedding.")
+    try:
+        vector = [float(value) for value in values]
+    except (TypeError, ValueError) as exc:
+        raise ResumeEmbeddingError("Gemini returned an invalid embedding.") from exc
+    if not all(math.isfinite(value) for value in vector):
+        raise ResumeEmbeddingError("Gemini returned an invalid embedding.")
+    magnitude = math.sqrt(sum(value * value for value in vector))
+    if magnitude == 0:
+        raise ResumeEmbeddingError("Gemini returned an invalid embedding.")
+    return [value / magnitude for value in vector]
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    if not settings.GEMINI_API_KEY:
+        raise ResumeEmbeddingConfigurationError(
+            "Gemini API key is not configured."
+        )
+
+    embeddings = []
+    try:
+        with genai.Client(
+            api_key=settings.GEMINI_API_KEY,
+            http_options=HttpOptions(
+                timeout=EMBEDDING_TIMEOUT_MS,
+                retry_options=HttpRetryOptions(
+                    attempts=2,
+                    initial_delay=0.2,
+                    max_delay=0.5,
+                    exp_base=2,
+                    jitter=0.1,
+                    http_status_codes=[429, 503],
+                ),
+            ),
+        ) as client:
+            for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+                batch = texts[start : start + EMBEDDING_BATCH_SIZE]
+                response = client.models.embed_content(
+                    model=EMBEDDING_MODEL,
+                    contents=batch,
+                    config=EmbedContentConfig(
+                        output_dimensionality=EMBEDDING_DIMENSIONS
+                    ),
+                )
+                batch_embeddings = response.embeddings or []
+                if len(batch_embeddings) != len(batch):
+                    raise ResumeEmbeddingError(
+                        "Gemini returned an invalid embedding response."
+                    )
+                embeddings.extend(
+                    _normalized_embedding(embedding.values)
+                    for embedding in batch_embeddings
+                )
+    except (APIError, HTTPError, TimeoutError) as exc:
+        logger.warning(
+            "Gemini embedding request failed (type=%s, code=%s).",
+            type(exc).__name__,
+            getattr(exc, "code", "unknown"),
+        )
+        raise ResumeEmbeddingError(
+            "The resume embedding service is temporarily unavailable."
+        ) from exc
+    return embeddings
+
+
+def _collection_metadata(resume_id: str) -> dict[str, str | int]:
+    return {"resume_id": resume_id, **_EMBEDDING_METADATA}
+
+
+def _stored_vector_is_compatible(vector: Any) -> bool:
+    if vector is None or len(vector) != EMBEDDING_DIMENSIONS:
+        return False
+    try:
+        values = [float(value) for value in vector]
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in values):
+        return False
+    magnitude = math.sqrt(sum(value * value for value in values))
+    return math.isclose(magnitude, 1.0, rel_tol=1e-3, abs_tol=1e-3)
+
+
+def _collection_is_compatible(collection: Any, resume_id: str) -> bool:
+    metadata = collection.metadata or {}
+    if any(
+        metadata.get(key) != value
+        for key, value in _collection_metadata(resume_id).items()
+    ):
+        return False
+    if not collection.count():
+        return True
+    stored = collection.get(limit=1, include=["embeddings"]).get("embeddings")
+    return (
+        stored is not None
+        and len(stored) > 0
+        and _stored_vector_is_compatible(stored[0])
+    )
+
+
+def _new_collection(client: chromadb.ClientAPI, resume_id: str) -> Any:
+    return client.create_collection(
         name=_collection_name(resume_id),
-        metadata={"resume_id": resume_id},
+        metadata=_collection_metadata(resume_id),
         embedding_function=None,
     )
+
+
+def index_resume(resume_id: str, chunks: list[dict[str, Any]]) -> None:
+    texts = [
+        f"title: {chunk['section']} | text: {chunk['text']}" for chunk in chunks
+    ]
+    embeddings = _embed_texts(texts)
+    client = _get_chroma_client()
+    name = _collection_name(resume_id)
+    try:
+        collection = client.get_collection(name=name, embedding_function=None)
+    except NotFoundError:
+        collection = _new_collection(client, resume_id)
+    else:
+        if not _collection_is_compatible(collection, resume_id):
+            client.delete_collection(name=name)
+            collection = _new_collection(client, resume_id)
+
     collection.add(
         ids=[str(chunk["chunk_index"]) for chunk in chunks],
         documents=[chunk["text"] for chunk in chunks],
@@ -183,11 +321,16 @@ def search_resume(
             f"No resume index exists for resume_id '{resume_id}'."
         ) from exc
 
+    if not _collection_is_compatible(collection, resume_id):
+        raise ResumeIndexIncompatible(
+            "This resume index uses incompatible embeddings. Please upload the resume again."
+        )
+
     count = collection.count()
     if not count:
         return []
 
-    query_embedding = _get_embedding_model().encode([query]).tolist()
+    query_embedding = _embed_texts([f"task: question answering | query: {query}"])
     where = {"section": section} if section else None
     matches = collection.query(
         query_embeddings=query_embedding,

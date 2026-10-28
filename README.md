@@ -8,7 +8,7 @@ Resume-aware AI placement preparation platform.
 - Frontend: React + Vite, plain CSS
 - Backend: Python + FastAPI
 - Vector DB: ChromaDB
-- Embeddings: sentence-transformers
+- Embeddings: Gemini Embedding 2 API
 - LLM: Gemini API
 
 ## Run the backend
@@ -46,4 +46,4 @@ Deploy both services from the repository's `render.yaml`:
 
 The Blueprint marks these values as dashboard-provided. Render may ask for them during the initial Blueprint setup; update the URL-dependent values in the service dashboards once Render assigns the service URLs. `VITE_API_URL` is embedded by Vite at build time, so changing it requires rebuilding the frontend.
 
-The backend uses Render's Free web-service plan and has no persistent disk. Uploaded PDFs, ChromaDB data, and SQLite history use the backend's local filesystem and may be lost after spin-downs, restarts, or redeployments; persistence is not guaranteed. The free service may spin down after inactivity, and `sentence-transformers` and ChromaDB may exceed its available memory during startup or use. This configuration is intended for a demo, not production.
+The backend uses Render's Free web-service plan and has no persistent disk. Uploaded PDFs, ChromaDB data, and SQLite history use the backend's local filesystem and may be lost after spin-downs, restarts, or redeployments; persistence is not guaranteed. The free service may spin down after inactivity. Resume embedding now uses the configured Gemini API rather than loading a local sentence-transformer model, so upload and search depend on Gemini API availability, latency, quotas, and credentials. Pre-existing resume indexes without embedding metadata require the resume to be uploaded again; incompatible vectors are not reused. This configuration is intended for a demo, not production.
