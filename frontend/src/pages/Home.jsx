@@ -538,12 +538,33 @@ export default function Home() {
   async function handleOpenPracticeHistory(sessionId) {
     setPracticeHistoryBusy(true);
     setPracticeHistoryError("");
+    setPracticeHistory(null);
     setPracticeQuestionHistory(null);
     try {
       const result = await getPreparationHistory(sessionId);
       setPracticeHistory(result);
     } catch (error) {
-      setPracticeHistoryError(error.message);
+      if (error.status === 404) {
+        const savedSessions = practiceHistoryIds.filter(
+          (item) => item.session_id !== sessionId
+        );
+        setPracticeHistoryIds(savedSessions);
+        try {
+          window.localStorage.setItem(
+            "placementprep-practice-sessions",
+            JSON.stringify(savedSessions)
+          );
+          setPracticeHistoryError(
+            "This practice session is no longer available and was removed from saved history in this browser."
+          );
+        } catch {
+          setPracticeHistoryError(
+            "This practice session is no longer available. The stale saved link could not be removed from this browser."
+          );
+        }
+      } else {
+        setPracticeHistoryError(error.message);
+      }
     } finally {
       setPracticeHistoryBusy(false);
     }
@@ -1099,6 +1120,10 @@ export default function Home() {
               <div>
                 <h2>Practice history</h2>
                 <p>Revisit saved DSA, SQL, and HR sessions.</p>
+                <p className="helper-note">
+                  On Render Free, practice history may be lost when the service
+                  restarts or redeploys.
+                </p>
               </div>
             </div>
             {practiceHistoryIds.length === 0 ? (

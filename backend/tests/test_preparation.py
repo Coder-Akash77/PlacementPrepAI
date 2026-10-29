@@ -44,6 +44,32 @@ class PreparationTests(unittest.TestCase):
             list(modes),
         )
 
+    def test_history_returns_404_when_the_backend_database_is_replaced(self):
+        with patch.object(
+            preparation_api,
+            "generate_preparation_question",
+            return_value="Explain binary search.",
+        ):
+            created = self.client.post(
+                "/api/preparation/question",
+                json={"mode": "dsa"},
+            )
+        self.assertEqual(created.status_code, 200)
+        session_id = created.json()["session_id"]
+
+        with tempfile.TemporaryDirectory() as replacement_database:
+            with patch.object(
+                settings,
+                "HISTORY_DB_PATH",
+                f"{replacement_database}\\history.db",
+            ):
+                history = self.client.get(
+                    f"/api/preparation/history/{session_id}"
+                )
+
+        self.assertEqual(history.status_code, 404)
+        self.assertEqual(history.json()["detail"], "Practice session not found.")
+
     def test_evaluates_all_modes_with_structured_feedback(self):
         modes = ("dsa", "sql", "hr")
         feedback = {

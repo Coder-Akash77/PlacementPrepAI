@@ -21,9 +21,11 @@ async function request(path, options = {}) {
     const message = Array.isArray(detail)
       ? detail.map((item) => item.msg).join(" ")
       : detail;
-    throw new Error(
+    const error = new Error(
       message || `Request failed with status ${response.status}.`
     );
+    error.status = response.status;
+    throw error;
   }
 
   return payload;
