@@ -6,7 +6,7 @@ from time import perf_counter
 from google import genai
 from google.genai.errors import APIError
 from google.genai.types import HttpOptions, HttpRetryOptions
-from httpx import Request, Response
+from httpx import Request, Response, TimeoutException
 
 from app.config import settings
 
@@ -20,6 +20,7 @@ _GEMINI_RETRY_OPTIONS = {
     "jitter": 0.1,
     "http_status_codes": [503],
 }
+_GEMINI_TIMEOUT_MS = 20_000
 
 
 class GeminiConfigurationError(RuntimeError):
@@ -44,7 +45,10 @@ def _safe_error_message(error: APIError) -> str:
 
 
 def _gemini_http_options() -> HttpOptions:
-    return HttpOptions(retry_options=HttpRetryOptions(**_GEMINI_RETRY_OPTIONS))
+    return HttpOptions(
+        timeout=_GEMINI_TIMEOUT_MS,
+        retry_options=HttpRetryOptions(**_GEMINI_RETRY_OPTIONS),
+    )
 
 
 def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
@@ -72,6 +76,9 @@ def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
                 model=settings.GEMINI_MODEL,
                 contents=prompt,
             )
+    except TimeoutException as exc:
+        logger.warning("Gemini request timed out.")
+        raise GeminiGenerationError("Gemini request timed out.") from exc
     except APIError as exc:
         logger.warning(
             "Gemini API request failed (code=%s, status=%s): %s",
@@ -299,6 +306,9 @@ def _generate_text(
                 "Gemini response validation finished duration_ms=%.1f",
                 (perf_counter() - validation_started) * 1000,
             )
+    except TimeoutException as exc:
+        logger.warning("Gemini request timed out.")
+        raise GeminiGenerationError("Gemini request timed out.") from exc
     except APIError as exc:
         logger.warning(
             "Gemini API request failed (code=%s, status=%s): %s",

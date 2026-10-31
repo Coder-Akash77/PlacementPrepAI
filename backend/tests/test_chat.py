@@ -217,6 +217,52 @@ class ChatTests(unittest.TestCase):
         self.assertIn("duration_ms=", messages)
         self.assertIn("Gemini generate_content call finished", messages)
 
+    def test_gemini_http_options_use_20_second_timeout_and_503_retries(self):
+        options = gemini._gemini_http_options()
+
+        self.assertEqual(options.timeout, 20_000)
+        self.assertEqual(options.retry_options.attempts, 3)
+        self.assertEqual(options.retry_options.http_status_codes, [503])
+
+    def test_gemini_sdk_timeout_maps_to_generation_error(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            raise httpx.ReadTimeout("request failed with test-secret")
+
+        options = gemini._gemini_http_options()
+        options.client_args = {"transport": httpx.MockTransport(respond)}
+        with (
+            patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
+            patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
+            patch.object(gemini, "_gemini_http_options", return_value=options),
+            self.assertLogs(gemini.logger, level="WARNING") as captured,
+        ):
+            with self.assertRaises(GeminiGenerationError) as error:
+                gemini.generate_preparation_question("dsa")
+
+        self.assertEqual(str(error.exception), "Gemini request timed out.")
+        self.assertNotIn("test-secret", "\n".join(captured.output))
+        self.assertIn("Gemini request timed out.", "\n".join(captured.output))
+        self.assertEqual(len(requests), 3)
+
+    def test_gemini_resume_timeout_maps_to_generation_error(self):
+        with (
+            patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
+            patch.object(
+                gemini.genai,
+                "Client",
+                side_effect=httpx.ReadTimeout("request failed with test-secret"),
+            ),
+            self.assertLogs(gemini.logger, level="WARNING") as captured,
+        ):
+            with self.assertRaises(GeminiGenerationError) as error:
+                gemini.answer_resume_question("Question?", [])
+
+        self.assertEqual(str(error.exception), "Gemini request timed out.")
+        self.assertNotIn("test-secret", "\n".join(captured.output))
+
     def test_gemini_sdk_503_retries_exhausted_map_to_generation_error(self):
         requests = []
 
