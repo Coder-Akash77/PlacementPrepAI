@@ -1,12 +1,11 @@
 import json
 import logging
-import re
 from time import perf_counter
 
 from google import genai
 from google.genai.errors import APIError
 from google.genai.types import HttpOptions, HttpRetryOptions
-from httpx import Request, Response, TimeoutException
+from httpx import HTTPError, Request, Response, TimeoutException
 
 from app.config import settings
 
@@ -31,17 +30,19 @@ class GeminiGenerationError(RuntimeError):
     """Raised when Gemini cannot generate a response."""
 
 
-def _safe_error_message(error: APIError) -> str:
-    message = getattr(error, "message", "") or "No provider message."
-    if settings.GEMINI_API_KEY:
-        message = message.replace(settings.GEMINI_API_KEY, "[REDACTED]")
-    message = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[REDACTED]", message)
-    message = re.sub(
-        r"(?i)(api[_ -]?key\s*[:=]\s*)[^\s,;]+",
-        r"\1[REDACTED]",
-        message,
+def _log_gemini_failure(kind: str, error: Exception) -> None:
+    response = getattr(error, "response", None)
+    status_code = getattr(error, "code", None)
+    if status_code is None:
+        status_code = getattr(response, "status_code", None)
+    status = getattr(error, "status", None)
+    logger.warning(
+        "Gemini %s. (error_type=%s status_code=%s status=%s)",
+        kind,
+        type(error).__name__,
+        status_code if status_code is not None else "unknown",
+        status if status is not None else "unknown",
     )
-    return message
 
 
 def _gemini_http_options() -> HttpOptions:
@@ -77,15 +78,13 @@ def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
                 contents=prompt,
             )
     except TimeoutException as exc:
-        logger.warning("Gemini request timed out.")
+        _log_gemini_failure("request timed out", exc)
         raise GeminiGenerationError("Gemini request timed out.") from exc
     except APIError as exc:
-        logger.warning(
-            "Gemini API request failed (code=%s, status=%s): %s",
-            getattr(exc, "code", "unknown"),
-            getattr(exc, "status", "unknown"),
-            _safe_error_message(exc),
-        )
+        _log_gemini_failure("API request failed", exc)
+        raise GeminiGenerationError("Gemini could not generate a response.") from exc
+    except HTTPError as exc:
+        _log_gemini_failure("HTTP transport failed", exc)
         raise GeminiGenerationError("Gemini could not generate a response.") from exc
 
     answer = response.text
@@ -307,15 +306,13 @@ def _generate_text(
                 (perf_counter() - validation_started) * 1000,
             )
     except TimeoutException as exc:
-        logger.warning("Gemini request timed out.")
+        _log_gemini_failure("request timed out", exc)
         raise GeminiGenerationError("Gemini request timed out.") from exc
     except APIError as exc:
-        logger.warning(
-            "Gemini API request failed (code=%s, status=%s): %s",
-            getattr(exc, "code", "unknown"),
-            getattr(exc, "status", "unknown"),
-            _safe_error_message(exc),
-        )
+        _log_gemini_failure("API request failed", exc)
+        raise GeminiGenerationError("Gemini could not generate a response.") from exc
+    except HTTPError as exc:
+        _log_gemini_failure("HTTP transport failed", exc)
         raise GeminiGenerationError("Gemini could not generate a response.") from exc
     finally:
         logger.info(

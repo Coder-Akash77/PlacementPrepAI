@@ -166,7 +166,9 @@ class ChatTests(unittest.TestCase):
         self.assertNotIn("sensitive", str(error.exception))
         self.assertIn("404", captured.output[0])
         self.assertIn("NOT_FOUND", captured.output[0])
-        self.assertIn("Model unavailable", captured.output[0])
+        self.assertIn("error_type=ClientError", captured.output[0])
+        self.assertIn("status_code=404", captured.output[0])
+        self.assertNotIn("Model unavailable", captured.output[0])
         self.assertNotIn("test-secret", captured.output[0])
 
     def test_gemini_sdk_retries_transient_503_then_succeeds(self):
@@ -245,6 +247,8 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(str(error.exception), "Gemini request timed out.")
         self.assertNotIn("test-secret", "\n".join(captured.output))
         self.assertIn("Gemini request timed out.", "\n".join(captured.output))
+        self.assertIn("error_type=ReadTimeout", "\n".join(captured.output))
+        self.assertIn("status_code=unknown", "\n".join(captured.output))
         self.assertEqual(len(requests), 3)
 
     def test_gemini_resume_timeout_maps_to_generation_error(self):
@@ -286,12 +290,16 @@ class ChatTests(unittest.TestCase):
             patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
             patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
             patch.object(gemini, "_gemini_http_options", return_value=options),
-            self.assertLogs(gemini.logger, level="WARNING"),
+            self.assertLogs(gemini.logger, level="WARNING") as captured,
         ):
             with self.assertRaises(GeminiGenerationError):
                 gemini.generate_preparation_question("sql")
 
         self.assertEqual(len(requests), 3)
+        messages = "\n".join(captured.output)
+        self.assertIn("error_type=ServerError", messages)
+        self.assertIn("status_code=503", messages)
+        self.assertIn("status=UNAVAILABLE", messages)
 
     def test_gemini_sdk_does_not_retry_authentication_errors(self):
         requests = []
