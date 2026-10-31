@@ -1,4 +1,7 @@
-from typing import Literal
+import logging
+from collections.abc import Callable
+from time import perf_counter
+from typing import Literal, TypeVar
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
@@ -13,7 +16,24 @@ from app.services.gemini import (
 from app.services import history
 
 router = APIRouter(prefix="/preparation", tags=["preparation"])
+logger = logging.getLogger(__name__)
 PreparationMode = Literal["dsa", "sql", "hr"]
+Result = TypeVar("Result")
+
+
+def _timed_operation(
+    name: str, mode: str, operation: Callable[[], Result]
+) -> Result:
+    started = perf_counter()
+    try:
+        return operation()
+    finally:
+        logger.info(
+            "Preparation %s finished mode=%s duration_ms=%.1f",
+            name,
+            mode,
+            (perf_counter() - started) * 1000,
+        )
 
 
 class QuestionRequest(BaseModel):
@@ -89,29 +109,63 @@ def _history_http_error(exc: Exception):
 
 @router.post("/question")
 def create_preparation_question(request: QuestionRequest):
+    endpoint_started = perf_counter()
+    outcome = "error"
     try:
-        question = generate_preparation_question(request.mode, request.topic)
-    except (GeminiConfigurationError, GeminiGenerationError) as exc:
-        raise _gemini_http_error(exc) from exc
-    try:
-        session_id = history.create_preparation_session(
-            request.mode, str(request.session_id) if request.session_id else None
+        try:
+            question = _timed_operation(
+                "question generation",
+                request.mode,
+                lambda: generate_preparation_question(request.mode, request.topic),
+            )
+        except (GeminiConfigurationError, GeminiGenerationError) as exc:
+            raise _gemini_http_error(exc) from exc
+
+        try:
+            session_id = _timed_operation(
+                "session creation",
+                request.mode,
+                lambda: history.create_preparation_session(
+                    request.mode,
+                    str(request.session_id) if request.session_id else None,
+                ),
+            )
+        except (
+            history.HistoryRecordNotFound,
+            history.HistoryConflictError,
+            history.HistoryStorageError,
+        ) as exc:
+            raise _history_http_error(exc) from exc
+
+        try:
+            question_id = _timed_operation(
+                "question persistence",
+                request.mode,
+                lambda: history.add_preparation_question(
+                    session_id, request.mode, question, request.topic
+                ),
+            )
+        except (
+            history.HistoryRecordNotFound,
+            history.HistoryConflictError,
+            history.HistoryStorageError,
+        ) as exc:
+            raise _history_http_error(exc) from exc
+
+        outcome = "success"
+        return {
+            "mode": request.mode,
+            "question": question,
+            "session_id": session_id,
+            "question_id": question_id,
+        }
+    finally:
+        logger.info(
+            "Preparation question endpoint finished mode=%s outcome=%s duration_ms=%.1f",
+            request.mode,
+            outcome,
+            (perf_counter() - endpoint_started) * 1000,
         )
-        question_id = history.add_preparation_question(
-            session_id, request.mode, question, request.topic
-        )
-    except (
-        history.HistoryRecordNotFound,
-        history.HistoryConflictError,
-        history.HistoryStorageError,
-    ) as exc:
-        raise _history_http_error(exc) from exc
-    return {
-        "mode": request.mode,
-        "question": question,
-        "session_id": session_id,
-        "question_id": question_id,
-    }
 
 
 @router.post("/evaluate")

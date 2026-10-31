@@ -1,10 +1,12 @@
 import json
 import logging
 import re
+from time import perf_counter
 
 from google import genai
 from google.genai.errors import APIError
 from google.genai.types import HttpOptions, HttpRetryOptions
+from httpx import Request, Response
 
 from app.config import settings
 
@@ -139,6 +141,7 @@ def evaluate_interview_answer(
 
 
 def generate_preparation_question(mode: str, topic: str | None = None) -> str:
+    prompt_started = perf_counter()
     mode_instructions = {
         "dsa": (
             "Ask one realistic algorithms or data-structures placement problem. "
@@ -171,7 +174,12 @@ def generate_preparation_question(mode: str, topic: str | None = None) -> str:
     )
     if topic:
         prompt += f"\nFocus topic: {topic}"
-    return _generate_text(prompt)
+    logger.info(
+        "Preparation prompt assembled mode=%s duration_ms=%.1f",
+        mode,
+        (perf_counter() - prompt_started) * 1000,
+    )
+    return _generate_text(prompt, log_http_attempts=True)
 
 
 def evaluate_preparation_answer(mode: str, question: str, answer: str) -> dict:
@@ -222,20 +230,74 @@ def evaluate_preparation_answer(mode: str, question: str, answer: str) -> dict:
     return evaluation
 
 
-def _generate_text(prompt: str, response_mime_type: str | None = None) -> str:
-    if not settings.GEMINI_API_KEY:
-        raise GeminiConfigurationError("Gemini API key is not configured.")
-
-    config = {"response_mime_type": response_mime_type} if response_mime_type else None
+def _generate_text(
+    prompt: str,
+    response_mime_type: str | None = None,
+    log_http_attempts: bool = False,
+) -> str:
+    generation_started = perf_counter()
+    outcome = "error"
     try:
-        with genai.Client(
-            api_key=settings.GEMINI_API_KEY,
-            http_options=_gemini_http_options(),
-        ) as client:
-            response = client.models.generate_content(
-                model=settings.GEMINI_MODEL,
-                contents=prompt,
-                config=config,
+        if not settings.GEMINI_API_KEY:
+            raise GeminiConfigurationError("Gemini API key is not configured.")
+
+        config = (
+            {"response_mime_type": response_mime_type}
+            if response_mime_type
+            else None
+        )
+        http_options = _gemini_http_options()
+        if log_http_attempts:
+            client_args = dict(http_options.client_args or {})
+            event_hooks = dict(client_args.get("event_hooks") or {})
+            event_hooks["request"] = [
+                *event_hooks.get("request", []),
+                _log_gemini_attempt_start,
+            ]
+            event_hooks["response"] = [
+                *event_hooks.get("response", []),
+                _log_gemini_attempt_response,
+            ]
+            client_args["event_hooks"] = event_hooks
+            http_options.client_args = client_args
+
+        client_started = perf_counter()
+        try:
+            client_context = genai.Client(
+                api_key=settings.GEMINI_API_KEY,
+                http_options=http_options,
+            )
+        finally:
+            logger.info(
+                "Gemini client initialization finished duration_ms=%.1f",
+                (perf_counter() - client_started) * 1000,
+            )
+
+        call_started = perf_counter()
+        try:
+            with client_context as client:
+                response = client.models.generate_content(
+                    model=settings.GEMINI_MODEL,
+                    contents=prompt,
+                    config=config,
+                )
+        finally:
+            logger.info(
+                "Gemini generate_content call finished duration_ms=%.1f",
+                (perf_counter() - call_started) * 1000,
+            )
+
+        validation_started = perf_counter()
+        try:
+            text = response.text
+            if not text or not text.strip():
+                raise GeminiGenerationError("Gemini returned an empty response.")
+            outcome = "success"
+            return text.strip()
+        finally:
+            logger.info(
+                "Gemini response validation finished duration_ms=%.1f",
+                (perf_counter() - validation_started) * 1000,
             )
     except APIError as exc:
         logger.warning(
@@ -245,8 +307,30 @@ def _generate_text(prompt: str, response_mime_type: str | None = None) -> str:
             _safe_error_message(exc),
         )
         raise GeminiGenerationError("Gemini could not generate a response.") from exc
+    finally:
+        logger.info(
+            "Gemini text generation finished outcome=%s duration_ms=%.1f",
+            outcome,
+            (perf_counter() - generation_started) * 1000,
+        )
 
-    text = response.text
-    if not text or not text.strip():
-        raise GeminiGenerationError("Gemini returned an empty response.")
-    return text.strip()
+
+def _log_gemini_attempt_start(request: Request) -> None:
+    attempt_number = request.extensions.get("placementprep_attempt_number", 0) + 1
+    request.extensions["placementprep_attempt_number"] = attempt_number
+    request.extensions["placementprep_attempt_started"] = perf_counter()
+    logger.info("Gemini HTTP attempt started attempt=%d", attempt_number)
+
+
+def _log_gemini_attempt_response(response: Response) -> None:
+    request = response.request
+    attempt_number = request.extensions.get("placementprep_attempt_number")
+    attempt_started = request.extensions.get("placementprep_attempt_started")
+    if attempt_number is None or attempt_started is None:
+        return
+    logger.info(
+        "Gemini HTTP attempt finished attempt=%d status_code=%d duration_ms=%.1f",
+        attempt_number,
+        response.status_code,
+        (perf_counter() - attempt_started) * 1000,
+    )

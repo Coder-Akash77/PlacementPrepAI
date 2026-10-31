@@ -202,6 +202,7 @@ class ChatTests(unittest.TestCase):
             patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
             patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
             patch.object(gemini, "_gemini_http_options", return_value=options),
+            self.assertLogs(gemini.logger, level="INFO") as captured,
         ):
             result = gemini.generate_preparation_question("dsa")
 
@@ -209,6 +210,12 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         self.assertEqual(options.retry_options.http_status_codes, [503])
         self.assertEqual(options.retry_options.attempts, 3)
+        messages = "\n".join(captured.output)
+        self.assertEqual(messages.count("Gemini HTTP attempt started"), 2)
+        self.assertIn("status_code=503", messages)
+        self.assertIn("status_code=200", messages)
+        self.assertIn("duration_ms=", messages)
+        self.assertIn("Gemini generate_content call finished", messages)
 
     def test_gemini_sdk_503_retries_exhausted_map_to_generation_error(self):
         requests = []

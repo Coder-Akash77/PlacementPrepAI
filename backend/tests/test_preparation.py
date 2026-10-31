@@ -44,6 +44,27 @@ class PreparationTests(unittest.TestCase):
             list(modes),
         )
 
+    def test_question_endpoint_logs_generation_history_and_total_timings(self):
+        with (
+            patch.object(
+                preparation_api,
+                "generate_preparation_question",
+                return_value="Explain binary search.",
+            ),
+            self.assertLogs(preparation_api.logger, level="INFO") as captured,
+        ):
+            response = self.client.post(
+                "/api/preparation/question",
+                json={"mode": "dsa"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        messages = "\n".join(captured.output)
+        self.assertIn("Preparation question generation finished", messages)
+        self.assertIn("Preparation session creation finished", messages)
+        self.assertIn("Preparation question persistence finished", messages)
+        self.assertIn("Preparation question endpoint finished", messages)
+
     def test_history_returns_404_when_the_backend_database_is_replaced(self):
         with patch.object(
             preparation_api,
