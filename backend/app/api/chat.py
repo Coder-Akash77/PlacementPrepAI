@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.services.gemini import (
     GeminiConfigurationError,
     GeminiGenerationError,
+    GeminiTemporaryUnavailableError,
     answer_resume_question,
 )
 from app.services.resume import (
@@ -48,6 +49,8 @@ def chat(request: ChatRequest):
     try:
         answer = answer_resume_question(request.question, chunks)
     except GeminiConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GeminiTemporaryUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GeminiGenerationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

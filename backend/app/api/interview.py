@@ -7,6 +7,7 @@ from app.services import history
 from app.services.gemini import (
     GeminiConfigurationError,
     GeminiGenerationError,
+    GeminiTemporaryUnavailableError,
     evaluate_interview_answer,
     generate_interview_question,
 )
@@ -106,6 +107,8 @@ def _evaluate(question: str, answer: str, resume_id: str) -> InterviewEvaluation
         return InterviewEvaluation.model_validate(raw_evaluation)
     except GeminiConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GeminiTemporaryUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (GeminiGenerationError, ValidationError) as exc:
         raise HTTPException(
             status_code=502, detail="Gemini returned an invalid evaluation."
@@ -128,6 +131,8 @@ def _generate_question(resume_id: str, questions: list[str]) -> str:
     try:
         return generate_interview_question(chunks, questions)
     except GeminiConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GeminiTemporaryUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except GeminiGenerationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

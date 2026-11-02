@@ -17,7 +17,7 @@ _GEMINI_RETRY_OPTIONS = {
     "max_delay": 0.5,
     "exp_base": 2,
     "jitter": 0.1,
-    "http_status_codes": [503],
+    "http_status_codes": [503, 504],
 }
 _GEMINI_TIMEOUT_MS = 20_000
 
@@ -28,6 +28,10 @@ class GeminiConfigurationError(RuntimeError):
 
 class GeminiGenerationError(RuntimeError):
     """Raised when Gemini cannot generate a response."""
+
+
+class GeminiTemporaryUnavailableError(GeminiGenerationError):
+    """Raised when Gemini remains unavailable after bounded retries."""
 
 
 def _log_gemini_failure(kind: str, error: Exception) -> None:
@@ -43,6 +47,15 @@ def _log_gemini_failure(kind: str, error: Exception) -> None:
         status_code if status_code is not None else "unknown",
         status if status is not None else "unknown",
     )
+
+
+def _gemini_api_error(error: APIError) -> GeminiGenerationError:
+    _log_gemini_failure("API request failed", error)
+    if getattr(error, "code", None) == 504:
+        return GeminiTemporaryUnavailableError(
+            "Gemini is temporarily unavailable. Please try again."
+        )
+    return GeminiGenerationError("Gemini could not generate a response.")
 
 
 def _gemini_http_options() -> HttpOptions:
@@ -81,8 +94,7 @@ def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
         _log_gemini_failure("request timed out", exc)
         raise GeminiGenerationError("Gemini request timed out.") from exc
     except APIError as exc:
-        _log_gemini_failure("API request failed", exc)
-        raise GeminiGenerationError("Gemini could not generate a response.") from exc
+        raise _gemini_api_error(exc) from exc
     except HTTPError as exc:
         _log_gemini_failure("HTTP transport failed", exc)
         raise GeminiGenerationError("Gemini could not generate a response.") from exc
@@ -309,8 +321,7 @@ def _generate_text(
         _log_gemini_failure("request timed out", exc)
         raise GeminiGenerationError("Gemini request timed out.") from exc
     except APIError as exc:
-        _log_gemini_failure("API request failed", exc)
-        raise GeminiGenerationError("Gemini could not generate a response.") from exc
+        raise _gemini_api_error(exc) from exc
     except HTTPError as exc:
         _log_gemini_failure("HTTP transport failed", exc)
         raise GeminiGenerationError("Gemini could not generate a response.") from exc

@@ -9,7 +9,11 @@ from google.genai.errors import ClientError
 from app.api import chat as chat_api
 from app.main import app
 from app.services import gemini
-from app.services.gemini import GeminiConfigurationError, GeminiGenerationError
+from app.services.gemini import (
+    GeminiConfigurationError,
+    GeminiGenerationError,
+    GeminiTemporaryUnavailableError,
+)
 
 
 class ChatTests(unittest.TestCase):
@@ -89,6 +93,29 @@ class ChatTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 502)
         self.assertNotIn("secret", response.text.lower())
+
+    def test_chat_maps_gemini_temporary_unavailability_to_503(self):
+        with patch.object(
+            chat_api,
+            "search_resume",
+            return_value=[],
+        ), patch.object(
+            chat_api,
+            "answer_resume_question",
+            side_effect=GeminiTemporaryUnavailableError(
+                "Gemini is temporarily unavailable. Please try again."
+            ),
+        ):
+            response = self.client.post(
+                "/api/chat",
+                json={"resume_id": self.resume_id, "question": "What skills?"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["detail"],
+            "Gemini is temporarily unavailable. Please try again.",
+        )
 
     def test_gemini_service_uses_configured_client_and_resume_context(self):
         class FakeResponse:
@@ -210,7 +237,7 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(result, "A practice question.")
         self.assertEqual(len(requests), 2)
-        self.assertEqual(options.retry_options.http_status_codes, [503])
+        self.assertEqual(options.retry_options.http_status_codes, [503, 504])
         self.assertEqual(options.retry_options.attempts, 3)
         messages = "\n".join(captured.output)
         self.assertEqual(messages.count("Gemini HTTP attempt started"), 2)
@@ -224,7 +251,7 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(options.timeout, 20_000)
         self.assertEqual(options.retry_options.attempts, 3)
-        self.assertEqual(options.retry_options.http_status_codes, [503])
+        self.assertEqual(options.retry_options.http_status_codes, [503, 504])
 
     def test_gemini_sdk_timeout_maps_to_generation_error(self):
         requests = []
@@ -300,6 +327,91 @@ class ChatTests(unittest.TestCase):
         self.assertIn("error_type=ServerError", messages)
         self.assertIn("status_code=503", messages)
         self.assertIn("status=UNAVAILABLE", messages)
+
+    def test_gemini_sdk_retries_provider_504_then_succeeds(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(
+                    504,
+                    json={
+                        "error": {
+                            "code": 504,
+                            "status": "DEADLINE_EXCEEDED",
+                            "message": "Provider deadline exceeded.",
+                        }
+                    },
+                    request=request,
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {"content": {"parts": [{"text": "A practice question."}]}}
+                    ]
+                },
+                request=request,
+            )
+
+        options = gemini._gemini_http_options()
+        options.client_args = {"transport": httpx.MockTransport(respond)}
+        with (
+            patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
+            patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
+            patch.object(gemini, "_gemini_http_options", return_value=options),
+            self.assertLogs(gemini.logger, level="INFO") as captured,
+        ):
+            result = gemini.generate_preparation_question("dsa")
+
+        self.assertEqual(result, "A practice question.")
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(options.retry_options.attempts, 3)
+        self.assertEqual(options.retry_options.http_status_codes, [503, 504])
+        messages = "\n".join(captured.output)
+        self.assertIn("status_code=504", messages)
+        self.assertIn("status_code=200", messages)
+
+    def test_gemini_sdk_exhausted_provider_504_is_temporary_unavailable(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(
+                504,
+                json={
+                    "error": {
+                        "code": 504,
+                        "status": "DEADLINE_EXCEEDED",
+                        "message": "Provider deadline exceeded.",
+                    }
+                },
+                request=request,
+            )
+
+        options = gemini._gemini_http_options()
+        options.client_args = {"transport": httpx.MockTransport(respond)}
+        with (
+            patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
+            patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
+            patch.object(gemini, "_gemini_http_options", return_value=options),
+            self.assertLogs(gemini.logger, level="WARNING") as captured,
+        ):
+            with self.assertRaises(GeminiTemporaryUnavailableError) as error:
+                gemini.generate_preparation_question("dsa")
+
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(
+            str(error.exception),
+            "Gemini is temporarily unavailable. Please try again.",
+        )
+        messages = "\n".join(captured.output)
+        self.assertIn("error_type=ServerError", messages)
+        self.assertIn("status_code=504", messages)
+        self.assertIn("status=DEADLINE_EXCEEDED", messages)
+        self.assertNotIn("Provider deadline exceeded", messages)
+        self.assertNotIn("test-secret", messages)
 
     def test_gemini_sdk_does_not_retry_authentication_errors(self):
         requests = []

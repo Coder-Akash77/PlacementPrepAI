@@ -7,7 +7,11 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.api import preparation as preparation_api
 from app.main import app
-from app.services.gemini import GeminiConfigurationError, GeminiGenerationError
+from app.services.gemini import (
+    GeminiConfigurationError,
+    GeminiGenerationError,
+    GeminiTemporaryUnavailableError,
+)
 
 
 class PreparationTests(unittest.TestCase):
@@ -157,6 +161,24 @@ class PreparationTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 503)
         self.assertNotIn("secret", response.text.lower())
+
+    def test_gemini_temporary_unavailability_returns_503(self):
+        with patch.object(
+            preparation_api,
+            "generate_preparation_question",
+            side_effect=GeminiTemporaryUnavailableError(
+                "Gemini is temporarily unavailable. Please try again."
+            ),
+        ):
+            response = self.client.post(
+                "/api/preparation/question", json={"mode": "dsa"}
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["detail"],
+            "Gemini is temporarily unavailable. Please try again.",
+        )
 
     def test_gemini_generation_error_returns_502_for_both_routes(self):
         with patch.object(

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from app.services.gemini import (
     GeminiConfigurationError,
     GeminiGenerationError,
+    GeminiTemporaryUnavailableError,
     evaluate_preparation_answer,
     generate_preparation_question,
 )
@@ -94,7 +95,9 @@ class PreparationFeedback(BaseModel):
 
 
 def _gemini_http_error(exc: GeminiConfigurationError | GeminiGenerationError):
-    if isinstance(exc, GeminiConfigurationError):
+    if isinstance(
+        exc, (GeminiConfigurationError, GeminiTemporaryUnavailableError)
+    ):
         return HTTPException(status_code=503, detail=str(exc))
     return HTTPException(status_code=502, detail=str(exc))
 
