@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from google.genai import types
+from google.genai.errors import ClientError, ServerError
 from httpx import ReadTimeout
 from pypdf.errors import PdfReadError
 
@@ -18,13 +19,24 @@ from app.services import resume as resume_service
 class FakeGeminiModels:
     def __init__(self):
         self.requests = []
+        self.count_requests = []
+        self.embed_errors = []
         self.response_embeddings = None
         self.response_missing_embeddings = False
+
+    def count_tokens(self, model, contents):
+        self.count_requests.append({"model": model, "contents": contents})
+        token_count = sum(
+            max(1, len(content.parts[0].text) // 4) for content in contents
+        )
+        return SimpleNamespace(total_tokens=token_count)
 
     def embed_content(self, model, contents, config):
         self.requests.append(
             {"model": model, "contents": contents, "config": config}
         )
+        if self.embed_errors:
+            raise self.embed_errors.pop(0)
         count = len(contents) if isinstance(contents, list) else 1
         embeddings = self.response_embeddings
         if embeddings is None:
@@ -56,20 +68,46 @@ class FakeCollection:
 
     def add(self, ids, documents, embeddings, metadatas):
         self.documents.extend(
-            {"text": text, "metadata": metadata, "embedding": embedding}
-            for text, metadata, embedding in zip(documents, metadatas, embeddings)
+            {
+                "id": item_id,
+                "text": text,
+                "metadata": metadata,
+                "embedding": embedding,
+            }
+            for item_id, text, metadata, embedding in zip(
+                ids, documents, metadatas, embeddings
+            )
         )
 
     def count(self):
         return len(self.documents)
 
-    def get(self, limit, include):
-        records = self.documents[:limit]
+    def get(self, limit=None, include=None, ids=None):
+        records = self.documents
+        if ids is not None:
+            requested = set(ids)
+            records = [record for record in records if record["id"] in requested]
+        if limit is not None:
+            records = records[:limit]
         return {
+            "ids": [record["id"] for record in records],
             "embeddings": [record["embedding"] for record in records]
-            if "embeddings" in include
+            if include and "embeddings" in include
             else None
         }
+
+    def upsert(self, ids, documents, embeddings, metadatas):
+        records = {record["id"]: record for record in self.documents}
+        for item_id, text, embedding, metadata in zip(
+            ids, documents, embeddings, metadatas
+        ):
+            records[item_id] = {
+                "id": item_id,
+                "text": text,
+                "metadata": metadata,
+                "embedding": embedding,
+            }
+        self.documents = list(records.values())
 
     def query(self, query_embeddings, n_results, where, include):
         self.last_query_embeddings = query_embeddings
@@ -115,6 +153,7 @@ class ResumeTests(unittest.TestCase):
             patch.object(resume_service, "_get_chroma_client", return_value=self.chroma),
             patch.object(resume_service.genai, "Client", return_value=self.gemini),
             patch.object(resume_service.settings, "GEMINI_API_KEY", "test-key"),
+            patch.object(resume_service.embedding_limiter, "acquire"),
         ]
         for mocked in self.patches:
             mocked.start()
@@ -201,7 +240,9 @@ class ResumeTests(unittest.TestCase):
                 ["Education"],
             )
 
-        collection = next(iter(self.chroma.collections.values()))
+        collection = self.chroma.collections[
+            resume_service._collection_name(resume_id)
+        ]
         self.assertEqual(
             collection.metadata["embedding_model"], "gemini-embedding-2"
         )
@@ -225,6 +266,7 @@ class ResumeTests(unittest.TestCase):
             len(self.gemini.models.requests[0]["contents"]),
             2,
         )
+        self.assertEqual(len(self.gemini.models.count_requests), 3)
         self.assertTrue(
             all(
                 isinstance(content, types.Content)
@@ -302,6 +344,130 @@ class ResumeTests(unittest.TestCase):
         self.assertIsNot(collection, legacy)
         self.assertEqual(collection.metadata["embedding_model"], "gemini-embedding-2")
         self.assertEqual([record["text"] for record in collection.documents], ["New document"])
+
+    def test_identical_chunks_reuse_persistent_embedding_cache(self):
+        chunk = {"text": "Python and Java", "section": "Skills", "chunk_index": 0}
+
+        resume_service.index_resume(str(uuid4()), [chunk])
+        resume_service.index_resume(str(uuid4()), [chunk])
+
+        self.assertEqual(len(self.gemini.models.requests), 1)
+        cache = self.chroma.collections[
+            resume_service._EMBEDDING_CACHE_COLLECTION
+        ]
+        self.assertEqual(cache.count(), 1)
+
+    def test_changed_chunks_embed_only_new_content(self):
+        first = [
+            {"text": "Python", "section": "Skills", "chunk_index": 0},
+            {"text": "Computer Science", "section": "Education", "chunk_index": 1},
+        ]
+        changed = [
+            first[0],
+            {"text": "New project", "section": "Projects", "chunk_index": 1},
+        ]
+
+        resume_service.index_resume(str(uuid4()), first)
+        resume_service.index_resume(str(uuid4()), changed)
+
+        self.assertEqual(len(self.gemini.models.requests), 2)
+        embedded_texts = [
+            content.parts[0].text
+            for request in self.gemini.models.requests
+            for content in request["contents"]
+        ]
+        self.assertEqual(
+            embedded_texts,
+            [
+                "title: Skills | text: Python",
+                "title: Education | text: Computer Science",
+                "title: Projects | text: New project",
+            ],
+        )
+
+    def test_concurrent_uploads_do_not_embed_the_same_chunk_twice(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        chunk = {"text": "Python and Java", "section": "Skills", "chunk_index": 0}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(
+                    lambda resume_id: resume_service.index_resume(resume_id, [chunk]),
+                    (str(uuid4()), str(uuid4())),
+                )
+            )
+
+        self.assertEqual(results, [None, None])
+        self.assertEqual(len(self.gemini.models.requests), 1)
+
+    def test_repeated_resume_upload_reuses_cached_chunk_embeddings(self):
+        text = "Skills:\nPython and Java"
+        with tempfile.TemporaryDirectory() as upload_dir:
+            with (
+                patch.object(resume_api, "extract_pdf_text", return_value=text),
+                patch.object(resume_service.settings, "UPLOAD_DIR", upload_dir),
+            ):
+                first = self.client.post(
+                    "/api/resume/upload",
+                    files={"file": ("resume.pdf", b"%PDF-1.4 test", "application/pdf")},
+                )
+                second = self.client.post(
+                    "/api/resume/upload",
+                    files={"file": ("resume.pdf", b"%PDF-1.4 test", "application/pdf")},
+                )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertNotEqual(first.json()["resume_id"], second.json()["resume_id"])
+        self.assertEqual(len(self.gemini.models.requests), 1)
+
+    def test_embedding_token_usage_is_sent_to_the_limiter(self):
+        resume_service._embed_texts(["A resume chunk"])
+
+        token_count = self.gemini.models.count_requests[0]["contents"][0].parts[0].text
+        self.assertEqual(
+            self.gemini.models.count_requests[0]["model"],
+            "gemini-embedding-2",
+        )
+        self.assertEqual(
+            resume_service.embedding_limiter.acquire.call_args_list[-1].kwargs,
+            {"tokens": max(1, len(token_count) // 4)},
+        )
+
+    def test_embedding_retries_503_through_the_shared_embedding_limiter(self):
+        self.gemini.models.embed_errors = [
+            ServerError(
+                503,
+                {"error": {"code": 503, "status": "UNAVAILABLE"}},
+            )
+        ]
+        with (
+            patch.object(resume_service.embedding_limiter, "acquire") as acquire,
+            patch("app.services.rate_limit.time.sleep"),
+        ):
+            result = resume_service._embed_texts(["A resume chunk"])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(self.gemini.models.requests), 2)
+        self.assertEqual(acquire.call_count, 3)
+        self.assertEqual(
+            [call.kwargs["tokens"] for call in acquire.call_args_list],
+            [0, 3, 3],
+        )
+
+    def test_embedding_429_is_not_retried_and_has_retry_after(self):
+        self.gemini.models.embed_errors = [
+            ClientError(
+                429,
+                {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}},
+            )
+        ]
+        with patch.object(resume_service.embedding_limiter, "acquire") as acquire:
+            with self.assertRaises(resume_service.RateLimitExceeded):
+                resume_service._embed_texts(["A resume chunk"])
+
+        self.assertEqual(len(self.gemini.models.requests), 1)
+        self.assertEqual(acquire.call_count, 2)
 
     def test_search_rejects_legacy_index_without_embedding_metadata(self):
         resume_id = str(uuid4())

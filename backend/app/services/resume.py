@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import re
+import threading
+import unicodedata
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
@@ -11,14 +14,20 @@ from typing import Any
 import chromadb
 from chromadb.errors import NotFoundError
 from google import genai
-from google.genai.errors import APIError
 from google.genai import types
+from google.genai.errors import APIError
 from google.genai.types import EmbedContentConfig, HttpOptions, HttpRetryOptions
 from httpx import HTTPError
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from app.config import settings
+from app.services.rate_limit import (
+    ProviderTemporarilyUnavailable,
+    RateLimitExceeded,
+    call_with_rate_limit,
+    embedding_limiter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +50,10 @@ EMBEDDING_DIMENSIONS = 768
 EMBEDDING_BATCH_SIZE = 32
 EMBEDDING_TIMEOUT_MS = 20_000
 EMBEDDING_NORMALIZATION = "l2"
+EMBEDDING_TOKEN_LIMIT_PER_MINUTE = 30_000
+_EMBEDDING_RETRY_OPTIONS = {"attempts": 1}
+_EMBEDDING_CACHE_COLLECTION = "embedding_cache_gemini_embedding_2_768"
+_embedding_cache_lock = threading.Lock()
 _EMBEDDING_METADATA = {
     "embedding_provider": "google",
     "embedding_model": EMBEDDING_MODEL,
@@ -196,51 +209,22 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
 
-    embeddings = []
     try:
         with genai.Client(
             api_key=settings.GEMINI_API_KEY,
             http_options=HttpOptions(
                 timeout=EMBEDDING_TIMEOUT_MS,
-                retry_options=HttpRetryOptions(
-                    attempts=2,
-                    initial_delay=0.2,
-                    max_delay=0.5,
-                    exp_base=2,
-                    jitter=0.1,
-                    http_status_codes=[429, 503],
-                ),
+                retry_options=HttpRetryOptions(**_EMBEDDING_RETRY_OPTIONS),
             ),
         ) as client:
+            embeddings = []
             for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-                batch = texts[start : start + EMBEDDING_BATCH_SIZE]
-                response = client.models.embed_content(
-                    model=EMBEDDING_MODEL,
-                    contents=[
-                        types.Content(
-                            parts=[types.Part.from_text(text=text)],
-                            role="user",
-                        )
-                        for text in batch
-                    ],
-                    config=EmbedContentConfig(
-                        output_dimensionality=EMBEDDING_DIMENSIONS
-                    ),
-                )
-                batch_embeddings = getattr(response, "embeddings", None) or []
-                if len(batch_embeddings) != len(batch):
-                    embedding_word = (
-                        "embedding" if len(batch_embeddings) == 1 else "embeddings"
-                    )
-                    text_word = "input text" if len(batch) == 1 else "input texts"
-                    raise ResumeEmbeddingError(
-                        f"Gemini returned {len(batch_embeddings)} {embedding_word} "
-                        f"for {len(batch)} {text_word}."
-                    )
                 embeddings.extend(
-                    _normalized_embedding(getattr(embedding, "values", None))
-                    for embedding in batch_embeddings
+                    _embed_batch(client, texts[start : start + EMBEDDING_BATCH_SIZE])
                 )
+            return embeddings
+    except (ProviderTemporarilyUnavailable, RateLimitExceeded):
+        raise
     except (APIError, HTTPError, TimeoutError) as exc:
         logger.warning(
             "Gemini embedding request failed (type=%s, code=%s).",
@@ -250,7 +234,139 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
         raise ResumeEmbeddingError(
             "The resume embedding service is temporarily unavailable."
         ) from exc
-    return embeddings
+
+
+def _embedding_contents(texts: list[str]) -> list[types.Content]:
+    return [
+        types.Content(parts=[types.Part.from_text(text=text)], role="user")
+        for text in texts
+    ]
+
+
+def _embed_batch(client: Any, texts: list[str]) -> list[list[float]]:
+    contents = _embedding_contents(texts)
+    token_response = call_with_rate_limit(
+        lambda: client.models.count_tokens(
+            model=EMBEDDING_MODEL,
+            contents=contents,
+        ),
+        embedding_limiter,
+    )
+    token_count = getattr(token_response, "total_tokens", None)
+    if token_count is None:
+        raise ResumeEmbeddingError(
+            "Gemini did not return an embedding token count."
+        )
+    if token_count > EMBEDDING_TOKEN_LIMIT_PER_MINUTE:
+        if len(texts) == 1:
+            raise RateLimitExceeded(
+                60,
+                "This embedding input exceeds the per-minute token limit.",
+            )
+        midpoint = len(texts) // 2
+        return _embed_batch(client, texts[:midpoint]) + _embed_batch(
+            client, texts[midpoint:]
+        )
+
+    response = call_with_rate_limit(
+        lambda: client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=contents,
+            config=EmbedContentConfig(output_dimensionality=EMBEDDING_DIMENSIONS),
+        ),
+        embedding_limiter,
+        tokens=token_count,
+    )
+    batch_embeddings = getattr(response, "embeddings", None) or []
+    if len(batch_embeddings) != len(texts):
+        embedding_word = "embedding" if len(batch_embeddings) == 1 else "embeddings"
+        text_word = "input text" if len(texts) == 1 else "input texts"
+        raise ResumeEmbeddingError(
+            f"Gemini returned {len(batch_embeddings)} {embedding_word} "
+            f"for {len(texts)} {text_word}."
+        )
+    return [
+        _normalized_embedding(getattr(embedding, "values", None))
+        for embedding in batch_embeddings
+    ]
+
+
+def _normalize_embedding_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    return " ".join(normalized.split())
+
+
+def _embedding_cache_id(text: str) -> str:
+    cache_material = (
+        f"{EMBEDDING_MODEL}\0{EMBEDDING_DIMENSIONS}\0"
+        f"{EMBEDDING_NORMALIZATION}\0{text}"
+    )
+    return hashlib.sha256(cache_material.encode("utf-8")).hexdigest()
+
+
+def _get_embedding_cache_collection(client: chromadb.ClientAPI) -> Any:
+    metadata = {
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_dimensions": EMBEDDING_DIMENSIONS,
+        "embedding_normalization": EMBEDDING_NORMALIZATION,
+        "cache_version": 1,
+    }
+    try:
+        collection = client.get_collection(
+            name=_EMBEDDING_CACHE_COLLECTION,
+            embedding_function=None,
+        )
+    except NotFoundError:
+        return client.create_collection(
+            name=_EMBEDDING_CACHE_COLLECTION,
+            metadata=metadata,
+            embedding_function=None,
+        )
+    if any(
+        (collection.metadata or {}).get(key) != value
+        for key, value in metadata.items()
+    ):
+        raise ResumeEmbeddingError("The resume embedding cache is incompatible.")
+    return collection
+
+
+def _embed_cached_chunks(texts: list[str]) -> list[list[float]]:
+    normalized_texts = [_normalize_embedding_text(text) for text in texts]
+    ids = [_embedding_cache_id(text) for text in normalized_texts]
+    if not ids:
+        return []
+
+    with _embedding_cache_lock:
+        collection = _get_embedding_cache_collection(_get_chroma_client())
+        unique_ids = list(dict.fromkeys(ids))
+        stored = collection.get(ids=unique_ids, include=["embeddings"])
+        cached = {}
+        stored_vectors = stored.get("embeddings")
+        if stored_vectors is not None:
+            for cache_id, vector in zip(stored.get("ids", []), stored_vectors):
+                if _stored_vector_is_compatible(vector):
+                    cached[cache_id] = [float(value) for value in vector]
+        missing_ids = [cache_id for cache_id in unique_ids if cache_id not in cached]
+        if missing_ids:
+            text_by_id = dict(zip(ids, normalized_texts))
+            for start in range(0, len(missing_ids), EMBEDDING_BATCH_SIZE):
+                batch_ids = missing_ids[start : start + EMBEDDING_BATCH_SIZE]
+                batch_texts = [text_by_id[cache_id] for cache_id in batch_ids]
+                embeddings = _embed_texts(batch_texts)
+                collection.upsert(
+                    ids=batch_ids,
+                    documents=batch_texts,
+                    embeddings=embeddings,
+                    metadatas=[
+                        {
+                            "embedding_model": EMBEDDING_MODEL,
+                            "embedding_dimensions": EMBEDDING_DIMENSIONS,
+                        }
+                        for _ in batch_ids
+                    ],
+                )
+                cached.update(zip(batch_ids, embeddings))
+        return [cached[cache_id] for cache_id in ids]
 
 
 def _collection_metadata(resume_id: str) -> dict[str, str | int]:
@@ -299,7 +415,7 @@ def index_resume(resume_id: str, chunks: list[dict[str, Any]]) -> None:
     texts = [
         f"title: {chunk['section']} | text: {chunk['text']}" for chunk in chunks
     ]
-    embeddings = _embed_texts(texts)
+    embeddings = _embed_cached_chunks(texts)
     client = _get_chroma_client()
     name = _collection_name(resume_id)
     try:

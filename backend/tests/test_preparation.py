@@ -12,6 +12,7 @@ from app.services.gemini import (
     GeminiGenerationError,
     GeminiTemporaryUnavailableError,
 )
+from app.services.rate_limit import RateLimitExceeded
 
 
 class PreparationTests(unittest.TestCase):
@@ -178,6 +179,25 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(
             response.json()["detail"],
             "Gemini is temporarily unavailable. Please try again.",
+        )
+
+    def test_generation_rate_limit_returns_retry_after(self):
+        with patch.object(
+            preparation_api,
+            "generate_preparation_question",
+            side_effect=RateLimitExceeded(
+                23, "AI request capacity is busy. Please retry shortly."
+            ),
+        ):
+            response = self.client.post(
+                "/api/preparation/question", json={"mode": "dsa"}
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["retry-after"], "23")
+        self.assertEqual(
+            response.json()["detail"],
+            "AI request capacity is busy. Please retry shortly.",
         )
 
     def test_gemini_generation_error_returns_502_for_both_routes(self):

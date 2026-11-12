@@ -2,6 +2,7 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from starlette.concurrency import run_in_threadpool
 
 from app.services.resume import (
     PDFProcessingError,
@@ -36,7 +37,7 @@ async def upload_resume(file: UploadFile = File(...)):
     chunks = chunk_text(text)
     resume_id = str(uuid4())
     try:
-        index_resume(resume_id, chunks)
+        await run_in_threadpool(index_resume, resume_id, chunks)
     except ResumeEmbeddingConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ResumeEmbeddingError as exc:

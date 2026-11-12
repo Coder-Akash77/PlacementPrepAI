@@ -8,17 +8,16 @@ from google.genai.types import HttpOptions, HttpRetryOptions
 from httpx import HTTPError, Request, Response, TimeoutException
 
 from app.config import settings
+from app.services.rate_limit import (
+    ProviderTemporarilyUnavailable,
+    RateLimitExceeded,
+    call_with_rate_limit,
+    generation_limiter,
+)
 
 logger = logging.getLogger(__name__)
 
-_GEMINI_RETRY_OPTIONS = {
-    "attempts": 3,
-    "initial_delay": 0.2,
-    "max_delay": 0.5,
-    "exp_base": 2,
-    "jitter": 0.1,
-    "http_status_codes": [503, 504],
-}
+_GEMINI_RETRY_OPTIONS = {"attempts": 1}
 _GEMINI_TIMEOUT_MS = 20_000
 
 
@@ -51,10 +50,22 @@ def _log_gemini_failure(kind: str, error: Exception) -> None:
 
 def _gemini_api_error(error: APIError) -> GeminiGenerationError:
     _log_gemini_failure("API request failed", error)
-    if getattr(error, "code", None) == 504:
+    if getattr(error, "code", None) in {503, 504}:
         return GeminiTemporaryUnavailableError(
             "Gemini is temporarily unavailable. Please try again."
         )
+    if getattr(error, "code", None) == 429:
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None)
+        retry_after = headers.get("Retry-After") if headers is not None else None
+        try:
+            retry_after_seconds = min(86400, max(1, int(retry_after)))
+        except (TypeError, ValueError):
+            retry_after_seconds = 60
+        raise RateLimitExceeded(
+            retry_after_seconds,
+            "Gemini request quota reached. Please retry after the indicated delay.",
+        ) from error
     return GeminiGenerationError("Gemini could not generate a response.")
 
 
@@ -86,10 +97,15 @@ def answer_resume_question(question: str, resume_chunks: list[dict]) -> str:
             api_key=settings.GEMINI_API_KEY,
             http_options=_gemini_http_options(),
         ) as client:
-            response = client.models.generate_content(
-                model=settings.GEMINI_MODEL,
-                contents=prompt,
+            response = call_with_rate_limit(
+                lambda: client.models.generate_content(
+                    model=settings.GEMINI_MODEL,
+                    contents=prompt,
+                ),
+                generation_limiter,
             )
+    except ProviderTemporarilyUnavailable as exc:
+        raise GeminiTemporaryUnavailableError(str(exc)) from exc
     except TimeoutException as exc:
         _log_gemini_failure("request timed out", exc)
         raise GeminiGenerationError("Gemini request timed out.") from exc
@@ -294,10 +310,13 @@ def _generate_text(
         call_started = perf_counter()
         try:
             with client_context as client:
-                response = client.models.generate_content(
-                    model=settings.GEMINI_MODEL,
-                    contents=prompt,
-                    config=config,
+                response = call_with_rate_limit(
+                    lambda: client.models.generate_content(
+                        model=settings.GEMINI_MODEL,
+                        contents=prompt,
+                        config=config,
+                    ),
+                    generation_limiter,
                 )
         finally:
             logger.info(
@@ -317,6 +336,8 @@ def _generate_text(
                 "Gemini response validation finished duration_ms=%.1f",
                 (perf_counter() - validation_started) * 1000,
             )
+    except ProviderTemporarilyUnavailable as exc:
+        raise GeminiTemporaryUnavailableError(str(exc)) from exc
     except TimeoutException as exc:
         _log_gemini_failure("request timed out", exc)
         raise GeminiGenerationError("Gemini request timed out.") from exc

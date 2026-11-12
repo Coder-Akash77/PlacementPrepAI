@@ -9,6 +9,7 @@ from google.genai.errors import ClientError
 from app.api import chat as chat_api
 from app.main import app
 from app.services import gemini
+from app.services import rate_limit
 from app.services.gemini import (
     GeminiConfigurationError,
     GeminiGenerationError,
@@ -20,6 +21,11 @@ class ChatTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
         self.resume_id = str(uuid4())
+        self.generation_admission = patch.object(
+            gemini.generation_limiter, "acquire"
+        )
+        self.generation_admission_mock = self.generation_admission.start()
+        self.addCleanup(self.generation_admission.stop)
 
     def test_chat_passes_retrieved_chunks_and_returns_answer(self):
         chunks = [{"section": "Skills", "text": "Python"}]
@@ -150,6 +156,38 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(answer, "Based on your resume, Python.")
 
+    def test_all_text_generation_entrypoints_use_the_shared_limiter(self):
+        class FakeModels:
+            def generate_content(self, **kwargs):
+                return type("Response", (), {"text": '{"score": 80}'})()
+
+        class FakeClient:
+            def __init__(self, api_key, http_options=None):
+                self.models = FakeModels()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        with (
+            patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
+            patch.object(gemini.genai, "Client", FakeClient),
+            patch.object(gemini.generation_limiter, "acquire") as acquire,
+        ):
+            self.assertEqual(
+                gemini.settings.GEMINI_MODEL,
+                "gemini-3.5-flash-lite",
+            )
+            gemini.answer_resume_question("Question?", [])
+            gemini.generate_preparation_question("dsa")
+            gemini.evaluate_preparation_answer("sql", "Question?", "Answer")
+            gemini.generate_interview_question([], [])
+            gemini.evaluate_interview_answer("Question?", "Answer", [])
+
+        self.assertEqual(acquire.call_count, 5)
+
     def test_gemini_service_handles_missing_api_key(self):
         with (
             patch.object(gemini.settings, "GEMINI_API_KEY", ""),
@@ -231,14 +269,14 @@ class ChatTests(unittest.TestCase):
             patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
             patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
             patch.object(gemini, "_gemini_http_options", return_value=options),
+            patch.object(rate_limit.time, "sleep"),
             self.assertLogs(gemini.logger, level="INFO") as captured,
         ):
             result = gemini.generate_preparation_question("dsa")
 
         self.assertEqual(result, "A practice question.")
         self.assertEqual(len(requests), 2)
-        self.assertEqual(options.retry_options.http_status_codes, [503, 504])
-        self.assertEqual(options.retry_options.attempts, 3)
+        self.assertEqual(options.retry_options.attempts, 1)
         messages = "\n".join(captured.output)
         self.assertEqual(messages.count("Gemini HTTP attempt started"), 2)
         self.assertIn("status_code=503", messages)
@@ -246,12 +284,12 @@ class ChatTests(unittest.TestCase):
         self.assertIn("duration_ms=", messages)
         self.assertIn("Gemini generate_content call finished", messages)
 
-    def test_gemini_http_options_use_20_second_timeout_and_503_retries(self):
+    def test_gemini_http_options_use_20_second_timeout_without_sdk_retries(self):
         options = gemini._gemini_http_options()
 
         self.assertEqual(options.timeout, 20_000)
-        self.assertEqual(options.retry_options.attempts, 3)
-        self.assertEqual(options.retry_options.http_status_codes, [503, 504])
+        self.assertEqual(options.retry_options.attempts, 1)
+        self.assertEqual(options.retry_options.http_status_codes, None)
 
     def test_gemini_sdk_timeout_maps_to_generation_error(self):
         requests = []
@@ -266,6 +304,7 @@ class ChatTests(unittest.TestCase):
             patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
             patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
             patch.object(gemini, "_gemini_http_options", return_value=options),
+            patch.object(rate_limit.time, "sleep"),
             self.assertLogs(gemini.logger, level="WARNING") as captured,
         ):
             with self.assertRaises(GeminiGenerationError) as error:
@@ -276,7 +315,7 @@ class ChatTests(unittest.TestCase):
         self.assertIn("Gemini request timed out.", "\n".join(captured.output))
         self.assertIn("error_type=ReadTimeout", "\n".join(captured.output))
         self.assertIn("status_code=unknown", "\n".join(captured.output))
-        self.assertEqual(len(requests), 3)
+        self.assertEqual(len(requests), 1)
 
     def test_gemini_resume_timeout_maps_to_generation_error(self):
         with (
@@ -317,7 +356,8 @@ class ChatTests(unittest.TestCase):
             patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
             patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
             patch.object(gemini, "_gemini_http_options", return_value=options),
-            self.assertLogs(gemini.logger, level="WARNING") as captured,
+            patch.object(rate_limit.time, "sleep"),
+            self.assertLogs(rate_limit.logger, level="WARNING") as captured,
         ):
             with self.assertRaises(GeminiGenerationError):
                 gemini.generate_preparation_question("sql")
@@ -327,6 +367,7 @@ class ChatTests(unittest.TestCase):
         self.assertIn("error_type=ServerError", messages)
         self.assertIn("status_code=503", messages)
         self.assertIn("status=UNAVAILABLE", messages)
+        self.assertEqual(self.generation_admission_mock.call_count, 3)
 
     def test_gemini_sdk_retries_provider_504_then_succeeds(self):
         requests = []
@@ -361,17 +402,19 @@ class ChatTests(unittest.TestCase):
             patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
             patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
             patch.object(gemini, "_gemini_http_options", return_value=options),
+            patch.object(rate_limit.time, "sleep"),
             self.assertLogs(gemini.logger, level="INFO") as captured,
         ):
             result = gemini.generate_preparation_question("dsa")
 
         self.assertEqual(result, "A practice question.")
         self.assertEqual(len(requests), 2)
-        self.assertEqual(options.retry_options.attempts, 3)
-        self.assertEqual(options.retry_options.http_status_codes, [503, 504])
+        self.assertEqual(options.retry_options.attempts, 1)
+        self.assertIsNone(options.retry_options.http_status_codes)
         messages = "\n".join(captured.output)
         self.assertIn("status_code=504", messages)
         self.assertIn("status_code=200", messages)
+        self.assertEqual(self.generation_admission_mock.call_count, 2)
 
     def test_gemini_sdk_exhausted_provider_504_is_temporary_unavailable(self):
         requests = []
@@ -396,7 +439,8 @@ class ChatTests(unittest.TestCase):
             patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
             patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
             patch.object(gemini, "_gemini_http_options", return_value=options),
-            self.assertLogs(gemini.logger, level="WARNING") as captured,
+            patch.object(rate_limit.time, "sleep"),
+            self.assertLogs(rate_limit.logger, level="WARNING") as captured,
         ):
             with self.assertRaises(GeminiTemporaryUnavailableError) as error:
                 gemini.generate_preparation_question("dsa")
@@ -413,6 +457,38 @@ class ChatTests(unittest.TestCase):
         self.assertNotIn("Provider deadline exceeded", messages)
         self.assertNotIn("test-secret", messages)
 
+    def test_gemini_sdk_does_not_retry_provider_rate_limit(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "17"},
+                json={
+                    "error": {
+                        "code": 429,
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "Quota exceeded; api_key=test-secret",
+                    }
+                },
+                request=request,
+            )
+
+        options = gemini._gemini_http_options()
+        options.client_args = {"transport": httpx.MockTransport(respond)}
+        with (
+            patch.object(gemini.settings, "GEMINI_API_KEY", "test-secret"),
+            patch.object(gemini.settings, "GEMINI_MODEL", "test-model"),
+            patch.object(gemini, "_gemini_http_options", return_value=options),
+            self.assertLogs(rate_limit.logger, level="WARNING") as captured,
+        ):
+            with self.assertRaises(rate_limit.RateLimitExceeded) as error:
+                gemini.generate_preparation_question("dsa")
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(error.exception.retry_after, 17)
+        self.assertNotIn("test-secret", "\n".join(captured.output))
     def test_gemini_sdk_does_not_retry_authentication_errors(self):
         requests = []
 
