@@ -55,7 +55,7 @@ class PersistentHistoryTests(unittest.TestCase):
                 f"/api/interview/{session_id}/evaluate"
             )
             self.assertEqual(evaluated.status_code, 200)
-            first_answer_id = history.get_interview_question(question_id)["answers"][0][
+            first_answer_id = history.get_interview_question(question_id, user_id="test-user")["answers"][0][
                 "answer_id"
             ]
 

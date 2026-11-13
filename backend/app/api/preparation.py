@@ -4,9 +4,11 @@ from time import perf_counter
 from typing import Literal, TypeVar
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from app.api.auth import get_current_user_id
+from app.api.quota import enforce_user_quota
 from app.services.gemini import (
     GeminiConfigurationError,
     GeminiGenerationError,
@@ -111,7 +113,9 @@ def _history_http_error(exc: Exception):
 
 
 @router.post("/question")
-def create_preparation_question(request: QuestionRequest):
+def create_preparation_question(
+    request: QuestionRequest, user_id: str = Depends(enforce_user_quota)
+):
     endpoint_started = perf_counter()
     outcome = "error"
     try:
@@ -131,6 +135,7 @@ def create_preparation_question(request: QuestionRequest):
                 lambda: history.create_preparation_session(
                     request.mode,
                     str(request.session_id) if request.session_id else None,
+                    user_id=user_id,
                 ),
             )
         except (
@@ -145,7 +150,11 @@ def create_preparation_question(request: QuestionRequest):
                 "question persistence",
                 request.mode,
                 lambda: history.add_preparation_question(
-                    session_id, request.mode, question, request.topic
+                    session_id,
+                    request.mode,
+                    question,
+                    request.topic,
+                    user_id=user_id,
                 ),
             )
         except (
@@ -172,7 +181,9 @@ def create_preparation_question(request: QuestionRequest):
 
 
 @router.post("/evaluate")
-def evaluate_preparation_response(request: EvaluateRequest):
+def evaluate_preparation_response(
+    request: EvaluateRequest, user_id: str = Depends(enforce_user_quota)
+):
     try:
         raw_feedback = evaluate_preparation_answer(
             request.mode, request.question, request.answer
@@ -193,6 +204,7 @@ def evaluate_preparation_response(request: EvaluateRequest):
             session_id = history.create_preparation_session(
                 request.mode,
                 str(request.session_id) if request.session_id else None,
+                user_id=user_id,
             )
         session_id, question_id, answer_id, evaluation_id = history.record_preparation_response(
             session_id,
@@ -201,6 +213,7 @@ def evaluate_preparation_response(request: EvaluateRequest):
             request.answer,
             feedback.model_dump(),
             str(request.question_id) if request.question_id else None,
+            user_id=user_id,
         )
     except (
         history.HistoryRecordNotFound,
@@ -218,18 +231,30 @@ def evaluate_preparation_response(request: EvaluateRequest):
     }
 
 
-@router.get("/history/{session_id}")
-def preparation_history(session_id: UUID):
+@router.get("/history")
+def list_preparation_history(user_id: str = Depends(get_current_user_id)):
     try:
-        return history.get_preparation_session(str(session_id))
+        return {"sessions": history.list_preparation_sessions(user_id=user_id)}
+    except history.HistoryStorageError as exc:
+        raise _history_http_error(exc) from exc
+
+
+@router.get("/history/{session_id}")
+def preparation_history(
+    session_id: UUID, user_id: str = Depends(get_current_user_id)
+):
+    try:
+        return history.get_preparation_session(str(session_id), user_id=user_id)
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_http_error(exc) from exc
 
 
 @router.get("/history/questions/{question_id}")
-def preparation_question_detail(question_id: UUID):
+def preparation_question_detail(
+    question_id: UUID, user_id: str = Depends(get_current_user_id)
+):
     try:
-        return history.get_preparation_question(str(question_id))
+        return history.get_preparation_question(str(question_id), user_id=user_id)
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_http_error(exc) from exc
 
@@ -248,11 +273,13 @@ class HistoricalAnswerRequest(BaseModel):
 
 @router.post("/history/questions/{question_id}/answers")
 def answer_historical_preparation_question(
-    question_id: UUID, request: HistoricalAnswerRequest
+    question_id: UUID,
+    request: HistoricalAnswerRequest,
+    user_id: str = Depends(get_current_user_id),
 ):
     try:
         answer_id = history.add_preparation_answer(
-            str(question_id), request.answer
+            str(question_id), request.answer, user_id=user_id
         )
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_http_error(exc) from exc
@@ -260,9 +287,11 @@ def answer_historical_preparation_question(
 
 
 @router.post("/history/answers/{answer_id}/evaluate")
-def reevaluate_historical_preparation_answer(answer_id: UUID):
+def reevaluate_historical_preparation_answer(
+    answer_id: UUID, user_id: str = Depends(enforce_user_quota)
+):
     try:
-        answer = history.get_preparation_answer(str(answer_id))
+        answer = history.get_preparation_answer(str(answer_id), user_id=user_id)
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_http_error(exc) from exc
     try:
@@ -278,7 +307,7 @@ def reevaluate_historical_preparation_answer(answer_id: UUID):
         ) from exc
     try:
         evaluation_id = history.add_preparation_evaluation(
-            str(answer_id), feedback.model_dump()
+            str(answer_id), feedback.model_dump(), user_id=user_id
         )
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_http_error(exc) from exc

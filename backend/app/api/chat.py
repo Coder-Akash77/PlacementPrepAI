@@ -1,8 +1,9 @@
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
+from app.api.quota import enforce_user_quota
 from app.services.gemini import (
     GeminiConfigurationError,
     GeminiGenerationError,
@@ -33,7 +34,7 @@ class ChatRequest(BaseModel):
         return question
 
 
-@router.post("/chat")
+@router.post("/chat", dependencies=[Depends(enforce_user_quota)])
 def chat(request: ChatRequest):
     try:
         chunks = search_resume(str(request.resume_id), request.question)

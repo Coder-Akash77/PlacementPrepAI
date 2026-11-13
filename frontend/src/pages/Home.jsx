@@ -9,6 +9,7 @@ import {
   getPreparationHistory,
   getPreparationQuestionHistory,
   generatePreparationQuestion,
+  listPreparationHistory,
   reevaluateHistoricalInterviewAnswer,
   reevaluateHistoricalPreparationAnswer,
   requestNextQuestion,
@@ -275,7 +276,7 @@ function HistoryQuestionDetails({
   );
 }
 
-export default function Home() {
+export default function Home({ user, onSignOut }) {
   const [backendStatus, setBackendStatus] = useState("checking");
   const [resume, setResume] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -302,18 +303,7 @@ export default function Home() {
   const [preparationBusy, setPreparationBusy] = useState("");
   const [preparationError, setPreparationError] = useState("");
 
-  const [practiceHistoryIds, setPracticeHistoryIds] = useState(() => {
-    try {
-      const stored = JSON.parse(
-        window.localStorage.getItem("placementprep-practice-sessions") || "[]"
-      );
-      return Array.isArray(stored)
-        ? stored.filter((item) => item?.session_id && item?.mode)
-        : [];
-    } catch {
-      return [];
-    }
-  });
+  const [practiceSessions, setPracticeSessions] = useState([]);
   const [practiceHistory, setPracticeHistory] = useState(null);
   const [practiceQuestionHistory, setPracticeQuestionHistory] = useState(null);
   const [practiceHistoryBusy, setPracticeHistoryBusy] = useState(false);
@@ -339,6 +329,22 @@ export default function Home() {
     checkHealth()
       .then((data) => setBackendStatus(data.status === "ok" ? "online" : "unavailable"))
       .catch(() => setBackendStatus("offline"));
+  }, []);
+
+  async function refreshPracticeSessions() {
+    try {
+      const result = await listPreparationHistory();
+      setPracticeSessions(result.sessions || []);
+    } catch (error) {
+      setPracticeHistoryError(error.message);
+    }
+  }
+
+  useEffect(() => {
+    refreshPracticeSessions();
+    handleLoadInterviewHistory();
+    // Saved history is loaded once per sign-in.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function handleUpload(event) {
@@ -486,23 +492,7 @@ export default function Home() {
       );
       setPreparationSessionId(result.session_id);
       setPreparationQuestion(result);
-      const savedSessions = [
-        ...practiceHistoryIds.filter(
-          (item) => item.session_id !== result.session_id
-        ),
-        { session_id: result.session_id, mode: result.mode },
-      ];
-      setPracticeHistoryIds(savedSessions);
-      try {
-        window.localStorage.setItem(
-          "placementprep-practice-sessions",
-          JSON.stringify(savedSessions)
-        );
-      } catch {
-        setPreparationError(
-          "Question generated, but the practice session could not be saved in this browser."
-        );
-      }
+      refreshPracticeSessions();
     } catch (error) {
       setPreparationError(error.message);
     } finally {
@@ -544,27 +534,7 @@ export default function Home() {
       const result = await getPreparationHistory(sessionId);
       setPracticeHistory(result);
     } catch (error) {
-      if (error.status === 404) {
-        const savedSessions = practiceHistoryIds.filter(
-          (item) => item.session_id !== sessionId
-        );
-        setPracticeHistoryIds(savedSessions);
-        try {
-          window.localStorage.setItem(
-            "placementprep-practice-sessions",
-            JSON.stringify(savedSessions)
-          );
-          setPracticeHistoryError(
-            "This practice session is no longer available and was removed from saved history in this browser."
-          );
-        } catch {
-          setPracticeHistoryError(
-            "This practice session is no longer available. The stale saved link could not be removed from this browser."
-          );
-        }
-      } else {
-        setPracticeHistoryError(error.message);
-      }
+      setPracticeHistoryError(error.message);
     } finally {
       setPracticeHistoryBusy(false);
     }
@@ -639,13 +609,12 @@ export default function Home() {
   }
 
   async function handleLoadInterviewHistory() {
-    if (!resume?.resume_id) return;
     setInterviewHistoryBusy(true);
     setInterviewHistoryError("");
     setInterviewHistorySession(null);
     setInterviewQuestionHistory(null);
     try {
-      const result = await getInterviewHistory(resume.resume_id);
+      const result = await getInterviewHistory();
       setInterviewHistory(result.sessions || []);
     } catch (error) {
       setInterviewHistoryError(error.message);
@@ -744,9 +713,15 @@ export default function Home() {
           <span className="brand-mark">P</span>
           <span>PlacementPrep<span className="brand-accent">AI</span></span>
         </a>
-        <div className={`connection connection-${backendStatus}`} aria-live="polite">
-          <span className="connection-dot" />
-          Backend {backendStatus}
+        <div className="topbar-actions">
+          <div className={`connection connection-${backendStatus}`} aria-live="polite">
+            <span className="connection-dot" />
+            Backend {backendStatus}
+          </div>
+          <span className="user-name">{user?.name || user?.email}</span>
+          <button className="button button-outline" type="button" onClick={onSignOut}>
+            Sign out
+          </button>
         </div>
       </header>
 
@@ -1120,17 +1095,13 @@ export default function Home() {
               <div>
                 <h2>Practice history</h2>
                 <p>Revisit saved DSA, SQL, and HR sessions.</p>
-                <p className="helper-note">
-                  On Render Free, practice history may be lost when the service
-                  restarts or redeploys.
-                </p>
               </div>
             </div>
-            {practiceHistoryIds.length === 0 ? (
+            {practiceSessions.length === 0 ? (
               <p className="helper-note">Generated practice sessions will appear here.</p>
             ) : (
               <div className="answer-form">
-                {practiceHistoryIds.map((item) => (
+                {practiceSessions.map((item) => (
                   <button
                     className="button button-outline"
                     key={item.session_id}
@@ -1138,7 +1109,7 @@ export default function Home() {
                     onClick={() => handleOpenPracticeHistory(item.session_id)}
                     disabled={practiceHistoryBusy}
                   >
-                    {item.mode.toUpperCase()} session · {item.session_id.slice(0, 8)}
+                    {item.mode.toUpperCase()} session · {new Date(item.created_at).toLocaleString()} · {item.question_count} questions
                   </button>
                 ))}
               </div>
@@ -1205,12 +1176,12 @@ export default function Home() {
               className="button button-primary"
               type="button"
               onClick={handleLoadInterviewHistory}
-              disabled={!resume || interviewHistoryBusy}
+              disabled={interviewHistoryBusy}
             >
-              {interviewHistoryBusy ? "Loading history…" : "Load interview history"}
+              {interviewHistoryBusy ? "Loading history…" : "Refresh interview history"}
             </button>
-            {!resume && (
-              <p className="helper-note">Upload the resume used for an interview to view its history.</p>
+            {!interviewHistoryBusy && interviewHistory.length === 0 && (
+              <p className="helper-note">Completed mock interviews will appear here.</p>
             )}
             {interviewHistory.map((item) => (
               <button

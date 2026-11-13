@@ -910,3 +910,34 @@ textarea::placeholder {
     transition-duration: 0.01ms !important;
   }
 }
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.user-name {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login-card {
+  padding-top: 96px;
+}
+
+.google-button {
+  min-height: 44px;
+  margin-top: 28px;
+}
+
+@media (max-width: 640px) {
+  .user-name {
+    display: none;
+  }
+}

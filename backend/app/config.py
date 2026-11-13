@@ -21,6 +21,12 @@ class Settings:
     CHROMA_DIR: str = os.getenv("CHROMA_DIR", "./data/chroma")
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "./data/uploads")
     HISTORY_DB_PATH: str = os.getenv("HISTORY_DB_PATH", "./data/history.db")
+    # When set, history is stored in Postgres (e.g. Supabase) instead of SQLite.
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+
+    GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
+    SESSION_SECRET: str = os.getenv("SESSION_SECRET", "")
+    SESSION_TTL_SECONDS: int = 30 * 24 * 3600
 
 
 settings = Settings()

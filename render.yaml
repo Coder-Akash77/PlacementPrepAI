@@ -17,6 +17,14 @@ services:
         value: ./data/history.db
       - key: GEMINI_API_KEY
         sync: false
+      # Supabase Postgres connection string (use the pooler URL) so history
+      # survives Render restarts and redeploys.
+      - key: DATABASE_URL
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
       - key: FRONTEND_ORIGINS
         sync: false
   - type: web
@@ -27,4 +35,6 @@ services:
     staticPublishPath: dist
     envVars:
       - key: VITE_API_URL
+        sync: false
+      - key: VITE_GOOGLE_CLIENT_ID
         sync: false

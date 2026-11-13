@@ -1,8 +1,10 @@
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from app.api.auth import get_current_user_id
+from app.api.quota import enforce_user_quota
 from app.services import history
 from app.services.gemini import (
     GeminiConfigurationError,
@@ -73,9 +75,12 @@ class InterviewEvaluation(BaseModel):
         return answer
 
 
-def _get_session(session_id: UUID):
+def _get_session(session_id: UUID, user_id: str):
     try:
-        return get_session(str(session_id))
+        session = get_session(str(session_id))
+        if session.user_id != user_id:
+            raise InterviewSessionNotFound("Interview session not found.")
+        return session
     except InterviewSessionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except history.HistoryStorageError as exc:
@@ -139,10 +144,12 @@ def _generate_question(resume_id: str, questions: list[str]) -> str:
 
 
 @router.post("/start")
-def start_interview(request: InterviewStartRequest):
+def start_interview(
+    request: InterviewStartRequest, user_id: str = Depends(enforce_user_quota)
+):
     first_question = _generate_question(str(request.resume_id), [])
     try:
-        session = create_session(str(request.resume_id), first_question)
+        session = create_session(str(request.resume_id), first_question, user_id)
     except history.HistoryStorageError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
@@ -155,8 +162,11 @@ def start_interview(request: InterviewStartRequest):
 
 @router.post("/{session_id}/answer")
 def answer_interview_question(
-    session_id: UUID, request: InterviewAnswerRequest
+    session_id: UUID,
+    request: InterviewAnswerRequest,
+    user_id: str = Depends(get_current_user_id),
 ):
+    _get_session(session_id, user_id)
     try:
         submitted = submit_answer(str(session_id), request.answer)
     except InterviewSessionNotFound as exc:
@@ -174,8 +184,10 @@ def answer_interview_question(
 
 
 @router.post("/{session_id}/next")
-def next_interview_question(session_id: UUID):
-    session = _get_session(session_id)
+def next_interview_question(
+    session_id: UUID, user_id: str = Depends(enforce_user_quota)
+):
+    session = _get_session(session_id, user_id)
     try:
         questions = previous_questions(str(session_id))
     except InterviewSessionNotFound as exc:
@@ -200,8 +212,10 @@ def next_interview_question(session_id: UUID):
 
 
 @router.post("/{session_id}/evaluate")
-def evaluate_submitted_answer(session_id: UUID):
-    session = _get_session(session_id)
+def evaluate_submitted_answer(
+    session_id: UUID, user_id: str = Depends(enforce_user_quota)
+):
+    session = _get_session(session_id, user_id)
     try:
         submitted = latest_answer(str(session_id))
     except InterviewSessionNotFound as exc:
@@ -214,7 +228,7 @@ def evaluate_submitted_answer(session_id: UUID):
     )
     try:
         history.add_interview_evaluation(
-            submitted["answer_id"], evaluation.model_dump()
+            submitted["answer_id"], evaluation.model_dump(), user_id=user_id
         )
     except (history.HistoryStorageError, history.HistoryRecordNotFound) as exc:
         raise _history_error(exc) from exc
@@ -227,44 +241,61 @@ def evaluate_submitted_answer(session_id: UUID):
 
 
 @router.get("/history")
-def interview_history(resume_id: UUID):
+def interview_history(
+    resume_id: UUID | None = None, user_id: str = Depends(get_current_user_id)
+):
     try:
-        return {"sessions": history.list_interview_sessions(str(resume_id))}
+        return {
+            "sessions": history.list_interview_sessions(
+                user_id=user_id,
+                resume_id=str(resume_id) if resume_id else None,
+            )
+        }
     except history.HistoryStorageError as exc:
         raise _history_error(exc) from exc
 
 
 @router.get("/history/{session_id}")
-def interview_history_detail(session_id: UUID):
+def interview_history_detail(
+    session_id: UUID, user_id: str = Depends(get_current_user_id)
+):
     try:
-        return history.get_interview_session(str(session_id))
+        return history.get_interview_session(str(session_id), user_id=user_id)
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_error(exc) from exc
 
 
 @router.get("/history/questions/{question_id}")
-def interview_question_detail(question_id: UUID):
+def interview_question_detail(
+    question_id: UUID, user_id: str = Depends(get_current_user_id)
+):
     try:
-        return history.get_interview_question(str(question_id))
+        return history.get_interview_question(str(question_id), user_id=user_id)
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_error(exc) from exc
 
 
 @router.post("/history/questions/{question_id}/answers")
 def answer_historical_interview_question(
-    question_id: UUID, request: InterviewAnswerRequest
+    question_id: UUID,
+    request: InterviewAnswerRequest,
+    user_id: str = Depends(get_current_user_id),
 ):
     try:
-        answer_id = history.add_interview_answer(str(question_id), request.answer)
+        answer_id = history.add_interview_answer(
+            str(question_id), request.answer, user_id=user_id
+        )
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_error(exc) from exc
     return {"question_id": str(question_id), "answer_id": answer_id}
 
 
 @router.post("/history/answers/{answer_id}/evaluate")
-def reevaluate_historical_interview_answer(answer_id: UUID):
+def reevaluate_historical_interview_answer(
+    answer_id: UUID, user_id: str = Depends(enforce_user_quota)
+):
     try:
-        submitted = history.get_interview_answer(str(answer_id))
+        submitted = history.get_interview_answer(str(answer_id), user_id=user_id)
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_error(exc) from exc
     evaluation = _evaluate(
@@ -272,7 +303,7 @@ def reevaluate_historical_interview_answer(answer_id: UUID):
     )
     try:
         evaluation_id = history.add_interview_evaluation(
-            str(answer_id), evaluation.model_dump()
+            str(answer_id), evaluation.model_dump(), user_id=user_id
         )
     except (history.HistoryRecordNotFound, history.HistoryStorageError) as exc:
         raise _history_error(exc) from exc

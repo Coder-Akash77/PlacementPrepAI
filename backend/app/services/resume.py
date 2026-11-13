@@ -82,6 +82,10 @@ class ResumeIndexIncompatible(RuntimeError):
     """Raised when a stored resume index uses incompatible embeddings."""
 
 
+MAX_PDF_BYTES = 5 * 1024 * 1024
+MAX_PDF_PAGES = 20
+
+
 def extract_pdf_text(content: bytes) -> str:
     if not content.startswith(b"%PDF-"):
         raise PDFProcessingError("The uploaded file is not a valid PDF.")
@@ -92,6 +96,10 @@ def extract_pdf_text(content: bytes) -> str:
             raise PDFProcessingError("Encrypted PDFs are not supported.")
         if not reader.pages:
             raise PDFProcessingError("The PDF contains no pages.")
+        if len(reader.pages) > MAX_PDF_PAGES:
+            raise PDFProcessingError(
+                f"The PDF has too many pages. The maximum is {MAX_PDF_PAGES}."
+            )
         text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
     except PDFProcessingError:
         raise

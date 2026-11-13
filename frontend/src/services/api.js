@@ -1,10 +1,34 @@
 const API_URL = (
   import.meta.env.VITE_API_URL || "http://localhost:8000/api"
 ).replace(/\/+$/, "");
+const TOKEN_KEY = "placementprep-auth-token";
+export const AUTH_EXPIRED_EVENT = "placementprep-auth-expired";
+
+export function getAuthToken() {
+  try {
+    return window.localStorage.getItem(TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setAuthToken(token) {
+  try {
+    if (token) window.localStorage.setItem(TOKEN_KEY, token);
+    else window.localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // Without storage the user simply signs in again on the next visit.
+  }
+}
+
 async function request(path, options = {}) {
+  const token = getAuthToken();
+  const headers = token
+    ? { ...options.headers, Authorization: `Bearer ${token}` }
+    : options.headers;
   let response;
   try {
-    response = await fetch(`${API_URL}${path}`, options);
+    response = await fetch(`${API_URL}${path}`, { ...options, headers });
   } catch {
     throw new Error("Could not reach the backend. Check that it is running.");
   }
@@ -25,6 +49,10 @@ async function request(path, options = {}) {
       message || `Request failed with status ${response.status}.`
     );
     error.status = response.status;
+    if (response.status === 401 && token) {
+      setAuthToken("");
+      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+    }
     throw error;
   }
 
@@ -33,6 +61,18 @@ async function request(path, options = {}) {
 
 export function checkHealth() {
   return request("/health");
+}
+
+export function loginWithGoogle(credential) {
+  return request("/auth/google", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ credential }),
+  });
+}
+
+export function getCurrentUser() {
+  return request("/auth/me");
 }
 
 export function uploadResume(file) {
@@ -112,6 +152,10 @@ export function evaluatePreparationAnswer(
   });
 }
 
+export function listPreparationHistory() {
+  return request("/preparation/history");
+}
+
 export function getPreparationHistory(sessionId) {
   return request(`/preparation/history/${encodeURIComponent(sessionId)}`);
 }
@@ -140,8 +184,8 @@ export function reevaluateHistoricalPreparationAnswer(answerId) {
   );
 }
 
-export function getInterviewHistory(resumeId) {
-  return request(`/interview/history?resume_id=${encodeURIComponent(resumeId)}`);
+export function getInterviewHistory() {
+  return request("/interview/history");
 }
 
 export function getInterviewHistorySession(sessionId) {

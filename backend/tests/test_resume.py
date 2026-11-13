@@ -219,26 +219,13 @@ class ResumeTests(unittest.TestCase):
             resume_id = upload.json()["resume_id"]
             self.assertTrue((Path(upload_dir) / f"{resume_id}.pdf").exists())
 
-            all_results = self.client.get(
-                "/api/resume/search",
-                params={"resume_id": resume_id, "query": "degree", "top_k": 5},
-            )
-            self.assertEqual(all_results.status_code, 200)
-            self.assertEqual(len(all_results.json()["results"]), 2)
+            all_results = resume_service.search_resume(resume_id, "degree", top_k=5)
+            self.assertEqual(len(all_results), 2)
 
-            filtered = self.client.get(
-                "/api/resume/search",
-                params={
-                    "resume_id": resume_id,
-                    "query": "degree",
-                    "section": "Education",
-                },
+            filtered = resume_service.search_resume(
+                resume_id, "degree", section="Education"
             )
-            self.assertEqual(filtered.status_code, 200)
-            self.assertEqual(
-                [result["section"] for result in filtered.json()["results"]],
-                ["Education"],
-            )
+            self.assertEqual([result["section"] for result in filtered], ["Education"])
 
         collection = self.chroma.collections[
             resume_service._collection_name(resume_id)
@@ -476,11 +463,6 @@ class ResumeTests(unittest.TestCase):
         )
         with self.assertRaises(resume_service.ResumeIndexIncompatible):
             resume_service.search_resume(resume_id, "Python")
-        response = self.client.get(
-            "/api/resume/search",
-            params={"resume_id": resume_id, "query": "Python"},
-        )
-        self.assertEqual(response.status_code, 409)
         self.assertEqual(self.gemini.models.requests, [])
 
     def test_upload_maps_embedding_timeout_to_502_without_leaking_key(self):
@@ -509,13 +491,9 @@ class ResumeTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    def test_search_returns_404_for_missing_resume_index(self):
-        resume_id = str(uuid4())
-        response = self.client.get(
-            "/api/resume/search",
-            params={"resume_id": resume_id, "query": "Python"},
-        )
-        self.assertEqual(response.status_code, 404)
+    def test_search_raises_not_found_for_missing_resume_index(self):
+        with self.assertRaises(resume_service.ResumeIndexNotFound):
+            resume_service.search_resume(str(uuid4()), "Python")
 
 
 if __name__ == "__main__":
