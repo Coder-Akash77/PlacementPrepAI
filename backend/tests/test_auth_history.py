@@ -243,3 +243,152 @@ def test_history_endpoint_returns_503_and_logs_when_storage_is_down(client, capl
     assert response.status_code == 503
     assert response.json()["detail"] == "Persistent history is unavailable."
     assert any("History storage failed" in r.getMessage() for r in caplog.records)
+
+
+def test_malformed_password_fragments_never_reach_the_logs(caplog):
+    """A password containing '@' or brackets makes libpq report part of it as the host."""
+    import psycopg
+
+    url = "postgresql://postgres.abc:[Xy9@Zq778]@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
+    error = psycopg.OperationalError(
+        "failed to resolve host 'Zq778]@aws-1-ap-southeast-2.pooler.supabase.com': "
+        "[Errno -2] Name or service not known"
+    )
+    old = settings.DATABASE_URL
+    settings.DATABASE_URL = url
+    try:
+        with patch.object(history, "_connect", side_effect=error), caplog.at_level(
+            "ERROR", logger="app.services.history"
+        ):
+            with pytest.raises(history.HistoryStorageError):
+                history.list_preparation_sessions(user_id="alice")
+    finally:
+        settings.DATABASE_URL = old
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "Zq778" not in logged and "Xy9" not in logged
+    # The host stays visible, which is what makes the log useful for diagnosis.
+    assert "aws-1-ap-southeast-2.pooler.supabase.com" in logged
+    assert "Name or service not known" in logged
+
+
+def test_url_encoded_and_unrelated_credentials_are_redacted(caplog):
+    import psycopg
+
+    old = settings.DATABASE_URL
+    settings.DATABASE_URL = "postgresql://postgres.abc:p%40ss%2Fw0rd@host.example:5432/postgres"
+    error = psycopg.OperationalError(
+        'connection to "p@ss/w0rd" failed; also postgresql://other:hunter22@elsewhere/db'
+    )
+    try:
+        with patch.object(history, "_connect", side_effect=error), caplog.at_level(
+            "ERROR", logger="app.services.history"
+        ):
+            with pytest.raises(history.HistoryStorageError):
+                history.list_preparation_sessions(user_id="alice")
+    finally:
+        settings.DATABASE_URL = old
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    for secret in ("p@ss", "w0rd", "hunter22", "p%40ss"):
+        assert secret not in logged
+
+
+def test_secret_straddling_the_truncation_limit_is_still_redacted(caplog):
+    """Redaction must happen before the message is shortened, not after."""
+    import psycopg
+
+    password = "StraddleSecret99"
+    url = f"postgresql://postgres.abc:{password}@host.example:5432/postgres"
+    for padding in range(280, 300):  # slide the secret across the old 300-char cut
+        caplog.clear()
+        error = psycopg.OperationalError("x" * padding + f" password={password} tail")
+        old = settings.DATABASE_URL
+        settings.DATABASE_URL = url
+        try:
+            with patch.object(history, "_connect", side_effect=error), caplog.at_level(
+                "ERROR", logger="app.services.history"
+            ):
+                with pytest.raises(history.HistoryStorageError):
+                    history.list_preparation_sessions(user_id="alice")
+        finally:
+            settings.DATABASE_URL = old
+        logged = " ".join(record.getMessage() for record in caplog.records)
+        for piece in ("Straddle", "Secret99", "StraddleSecret99", "ecret9"):
+            assert piece not in logged, (padding, piece)
+
+
+# ------------------------------------------------ bounded connection retry
+
+
+@pytest.fixture
+def postgres_url():
+    old = settings.DATABASE_URL
+    settings.DATABASE_URL = "postgresql://postgres.abc:pw12345@host.example:5432/postgres"
+    yield settings.DATABASE_URL
+    settings.DATABASE_URL = old
+
+
+def test_connect_retries_once_after_a_transient_network_failure(postgres_url):
+    import psycopg
+    from unittest.mock import MagicMock
+
+    flaky = psycopg.OperationalError("connection failed: Network is unreachable")
+    with patch.object(history.psycopg, "connect", side_effect=[flaky, MagicMock()]) as connect, patch.object(
+        history.time, "sleep"
+    ) as sleep:
+        connection = history._connect()
+    assert connect.call_count == 2
+    sleep.assert_called_once_with(history._CONNECT_RETRY_DELAY_SECONDS)
+    assert connection is not None
+
+
+def test_connect_gives_up_after_the_strict_attempt_limit(postgres_url):
+    import psycopg
+
+    down = psycopg.OperationalError("connection failed: Network is unreachable")
+    with patch.object(history.psycopg, "connect", side_effect=down) as connect, patch.object(
+        history.time, "sleep"
+    ) as sleep:
+        with pytest.raises(history.HistoryStorageError):
+            history.list_preparation_sessions(user_id="alice")
+    assert connect.call_count == history._CONNECT_ATTEMPTS == 2
+    assert sleep.call_count == 1
+
+
+def test_connect_does_not_retry_rejections_such_as_a_wrong_password(postgres_url):
+    import psycopg
+
+    rejected = psycopg.errors.InvalidPassword("password authentication failed")
+    with patch.object(history.psycopg, "connect", side_effect=rejected) as connect, patch.object(
+        history.time, "sleep"
+    ) as sleep:
+        with pytest.raises(history.HistoryStorageError):
+            history.list_preparation_sessions(user_id="alice")
+    assert connect.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_retry_warning_does_not_leak_credentials(postgres_url, caplog):
+    import psycopg
+    from unittest.mock import MagicMock
+
+    flaky = psycopg.OperationalError(f"failed to connect to {postgres_url}")
+    with patch.object(history.psycopg, "connect", side_effect=[flaky, MagicMock()]), patch.object(
+        history.time, "sleep"
+    ), caplog.at_level("WARNING", logger="app.services.history"):
+        history._connect()
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "retrying" in logged
+    assert "pw12345" not in logged
+
+
+def test_a_retry_never_replays_a_write(db_path):
+    """Retrying only covers the connect step, so a failing statement runs once."""
+    calls = []
+
+    def operation(connection):
+        calls.append(1)
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.raises(history.HistoryStorageError):
+        history._run(True, operation)
+    assert calls == [1]

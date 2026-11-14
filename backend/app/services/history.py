@@ -3,9 +3,11 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 from uuid import uuid4
 
 import psycopg
@@ -64,16 +66,44 @@ class _PostgresConnection:
         self._connection.close()
 
 
+# A connection that fails before any statement runs is safe to retry: nothing
+# was executed, so a retry cannot duplicate a write. Keep this small and strict.
+_CONNECT_ATTEMPTS = 2
+_CONNECT_RETRY_DELAY_SECONDS = 0.5
+
+
+def _is_transient_connect_error(exc: psycopg.OperationalError) -> bool:
+    """Network-level failures, not rejections such as a wrong password."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    return sqlstate is None or sqlstate.startswith("08") or sqlstate == "53300"
+
+
+def _connect_postgres() -> "_PostgresConnection":
+    for attempt in range(1, _CONNECT_ATTEMPTS + 1):
+        try:
+            return _PostgresConnection(
+                psycopg.connect(
+                    settings.DATABASE_URL,
+                    row_factory=_pg_row_factory,
+                    prepare_threshold=None,  # required behind Supabase's pooler
+                    connect_timeout=10,
+                )
+            )
+        except psycopg.OperationalError as exc:
+            if attempt == _CONNECT_ATTEMPTS or not _is_transient_connect_error(exc):
+                raise
+            logger.warning(
+                "History database connection attempt %d/%d failed; retrying. %s",
+                attempt,
+                _CONNECT_ATTEMPTS,
+                _describe_storage_failure(exc),
+            )
+            time.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+
+
 def _connect():
     if settings.DATABASE_URL:
-        return _PostgresConnection(
-            psycopg.connect(
-                settings.DATABASE_URL,
-                row_factory=_pg_row_factory,
-                prepare_threshold=None,  # required behind Supabase's pooler
-                connect_timeout=10,
-            )
-        )
+        return _connect_postgres()
     path = settings.HISTORY_DB_PATH
     if path != ":memory:":
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -192,15 +222,38 @@ def _initialize(connection) -> None:
             _initialized_targets.add(target)
 
 
+_MAX_LOGGED_DETAIL = 600
+
+
+def _secret_fragments(url: str) -> list[str]:
+    """The password in a connection string plus the pieces a parser may split it into.
+
+    A password containing "@" or brackets makes libpq report part of it as the
+    "host", so redacting only the whole URL is not enough.
+    """
+    try:
+        userinfo = url.split("://", 1)[1].rsplit("@", 1)[0]
+        password = userinfo.split(":", 1)[1]
+    except IndexError:
+        return []
+    candidates = {password, unquote(password), *re.split(r"[@\[\]/:\s]+", password)}
+    return sorted((c for c in candidates if len(c) >= 3), key=len, reverse=True)
+
+
 def _describe_storage_failure(exc: Exception) -> str:
-    """A log-safe summary of a storage failure: never the connection string."""
-    message = " ".join(str(exc).split())[:300]
-    for secret in (settings.DATABASE_URL,):
-        if secret:
-            message = message.replace(secret, "<DATABASE_URL>")
-    # Redact any credentials embedded in a URL inside the message.
-    message = re.sub(r"(\w+://[^:/\s]+:)[^@\s]+@", r"\1<redacted>@", message)
-    backend = "postgres" if settings.DATABASE_URL else "sqlite"
+    """A log-safe summary of a storage failure: never credentials."""
+    message = " ".join(str(exc).split())
+    url = settings.DATABASE_URL
+    if url:
+        message = message.replace(url, "<DATABASE_URL>")
+        for fragment in _secret_fragments(url):
+            message = message.replace(fragment, "<redacted>")
+    # Credentials embedded in any URL, and anything left in front of an "@host".
+    message = re.sub(r"(\w+://[^:/\s]+:)[^@\s]+@", r"\g<1><redacted>@", message)
+    message = re.sub(r"(['\"])[^'\"\s@]*@", r"\g<1><redacted>@", message)
+    # Shorten only after redacting, so a cut can never expose half a secret.
+    message = message[:_MAX_LOGGED_DETAIL]
+    backend = "postgres" if url else "sqlite"
     return (
         f"backend={backend} error_type={type(exc).__name__} "
         f"sqlstate={getattr(exc, 'sqlstate', None) or 'n/a'} detail={message}"
