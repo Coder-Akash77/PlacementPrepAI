@@ -340,6 +340,32 @@ export default function Home({ user, onSignOut }) {
     }
   }
 
+  async function refreshInterviewSessions() {
+    try {
+      const result = await getInterviewHistory();
+      setInterviewHistory(result.sessions || []);
+    } catch {
+      // The list refreshes silently; a failure here must not hide the interview itself.
+    }
+  }
+
+  // The resume index and live interview sessions live in server memory, so a
+  // backend restart makes them disappear. Tell the user what to do instead of
+  // leaving them on a dead end.
+  function explainLostServerState(error) {
+    if (error.status !== 404) return error.message;
+    if (/resume not found/i.test(error.message)) {
+      setResume(null);
+      setInterview(null);
+      return "Your resume is no longer on the server (it may have restarted). Please upload it again.";
+    }
+    if (/interview session not found/i.test(error.message)) {
+      setInterview(null);
+      return "This interview session expired because the server restarted. Your saved history is safe; start a new interview.";
+    }
+    return error.message;
+  }
+
   useEffect(() => {
     refreshPracticeSessions();
     handleLoadInterviewHistory();
@@ -395,7 +421,7 @@ export default function Home({ user, onSignOut }) {
       ]);
     } catch (error) {
       setQuestion(trimmedQuestion);
-      setChatError(error.message);
+      setChatError(explainLostServerState(error));
     } finally {
       setSendingChat(false);
     }
@@ -411,8 +437,9 @@ export default function Home({ user, onSignOut }) {
       setAnswer("");
       setAnswerSubmitted(false);
       setEvaluation(null);
+      refreshInterviewSessions();
     } catch (error) {
-      setInterviewError(error.message);
+      setInterviewError(explainLostServerState(error));
     } finally {
       setInterviewBusy("");
     }
@@ -431,7 +458,7 @@ export default function Home({ user, onSignOut }) {
       setAnswerSubmitted(true);
       setEvaluation(null);
     } catch (error) {
-      setInterviewError(error.message);
+      setInterviewError(explainLostServerState(error));
     } finally {
       setInterviewBusy("");
     }
@@ -446,7 +473,7 @@ export default function Home({ user, onSignOut }) {
       const result = await evaluateInterviewAnswer(interview.session_id);
       setEvaluation(result);
     } catch (error) {
-      setInterviewError(error.message);
+      setInterviewError(explainLostServerState(error));
     } finally {
       setInterviewBusy("");
     }
@@ -462,8 +489,9 @@ export default function Home({ user, onSignOut }) {
       setAnswer("");
       setAnswerSubmitted(false);
       setEvaluation(null);
+      refreshInterviewSessions();
     } catch (error) {
-      setInterviewError(error.message);
+      setInterviewError(explainLostServerState(error));
     } finally {
       setInterviewBusy("");
     }
