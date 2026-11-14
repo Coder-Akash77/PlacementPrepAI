@@ -200,3 +200,46 @@ def test_existing_database_without_user_column_is_migrated(db_path):
     # Pre-account rows are kept but belong to nobody.
     with pytest.raises(history.HistoryRecordNotFound):
         history.get_preparation_session("old", user_id="alice")
+
+
+# ------------------------------------------------ storage failures are diagnosable
+
+
+def test_storage_failure_is_logged_without_leaking_the_connection_string(caplog):
+    """A Postgres failure used to surface only as a generic 503 with no log line."""
+    import psycopg
+
+    password = "s3cr3t-pa55"
+    url = f"postgresql://postgres.abc:{password}@aws-0-eu.pooler.supabase.com:5432/postgres"
+    old = settings.DATABASE_URL
+    settings.DATABASE_URL = url
+    error = psycopg.OperationalError(
+        f'connection failed: FATAL: Tenant or user not found (dsn {url})'
+    )
+    try:
+        with patch.object(history, "_connect", side_effect=error), caplog.at_level(
+            "ERROR", logger="app.services.history"
+        ):
+            with pytest.raises(history.HistoryStorageError) as raised:
+                history.list_preparation_sessions(user_id="alice")
+    finally:
+        settings.DATABASE_URL = old
+
+    assert str(raised.value) == "Persistent history is unavailable."
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "backend=postgres" in logged
+    assert "OperationalError" in logged
+    assert "Tenant or user not found" in logged
+    assert password not in logged
+    assert url not in logged
+
+
+def test_history_endpoint_returns_503_and_logs_when_storage_is_down(client, caplog):
+    as_user("alice")
+    with patch.object(history, "_connect", side_effect=OSError("disk unavailable")), caplog.at_level(
+        "ERROR", logger="app.services.history"
+    ):
+        response = client.get("/api/preparation/history")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Persistent history is unavailable."
+    assert any("History storage failed" in r.getMessage() for r in caplog.records)

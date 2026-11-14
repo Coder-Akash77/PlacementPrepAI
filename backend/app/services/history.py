@@ -1,4 +1,6 @@
 import json
+import logging
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -9,6 +11,8 @@ from uuid import uuid4
 import psycopg
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class HistoryRecordNotFound(LookupError):
@@ -188,6 +192,21 @@ def _initialize(connection) -> None:
             _initialized_targets.add(target)
 
 
+def _describe_storage_failure(exc: Exception) -> str:
+    """A log-safe summary of a storage failure: never the connection string."""
+    message = " ".join(str(exc).split())[:300]
+    for secret in (settings.DATABASE_URL,):
+        if secret:
+            message = message.replace(secret, "<DATABASE_URL>")
+    # Redact any credentials embedded in a URL inside the message.
+    message = re.sub(r"(\w+://[^:/\s]+:)[^@\s]+@", r"\1<redacted>@", message)
+    backend = "postgres" if settings.DATABASE_URL else "sqlite"
+    return (
+        f"backend={backend} error_type={type(exc).__name__} "
+        f"sqlstate={getattr(exc, 'sqlstate', None) or 'n/a'} detail={message}"
+    )
+
+
 def _run(write: bool, operation):
     connection = None
     try:
@@ -204,8 +223,12 @@ def _run(write: bool, operation):
     except HistoryConflictError:
         raise
     except (sqlite3.Error, psycopg.Error, OSError, TypeError, ValueError) as exc:
+        logger.error("History storage failed. %s", _describe_storage_failure(exc))
         if connection is not None:
-            connection.rollback()
+            try:
+                connection.rollback()
+            except Exception:  # the connection may already be broken
+                pass
         raise HistoryStorageError("Persistent history is unavailable.") from exc
     finally:
         if connection is not None:
